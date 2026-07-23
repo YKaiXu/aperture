@@ -87,10 +87,6 @@ export default {
     let body;
     try {
       const raw = await request.text();
-      // Reject oversized payloads (>10MB)
-      if (raw.length > 10_485_760) {
-        return errorResponse("Request body too large", "invalid_request", "PAYLOAD_TOO_LARGE", 413);
-      }
       body = JSON.parse(raw);
     } catch {
       return errorResponse("Invalid JSON body", "invalid_request", "PARSE_ERROR", 400);
