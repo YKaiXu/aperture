@@ -15,7 +15,8 @@
   },
   "vars": {
     "UPSTREAM_BASE_URL": "https://opencode.ai/zen/go/v1",
-    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/7563e139c02b1788ac93a74d34595b1a/opencodego",
+    // AI_GATEWAY_URL is set via `wrangler secret put AI_GATEWAY_URL`
+    // to avoid exposing the Cloudflare Account ID in this file.
     "CUSTOM_PROVIDER_SLUG": "opencode-go",
     "DEFAULT_MODEL": "deepseek-v4-flash",
     "MODEL_MAP": "{\"dv4f\":\"deepseek-v4-flash\"}",
