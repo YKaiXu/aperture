@@ -1,0 +1,7 @@
+.dev.vars
+.env
+node_modules/
+.vscode/
+.DS_Store
+*.log
+wrangler.toml

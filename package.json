@@ -1,0 +1,13 @@
+{
+  "name": "aperture",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Universal AI Protocol Adapter — OpenAI Responses API + Anthropic Messages API → any OpenAI-compatible backend, backed by Cloudflare AI Gateway",
+  "main": "src/index.js",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "keywords": ["cloudflare", "workers", "ai-proxy", "anthropic", "openai", "responses-api", "ai-gateway"],
+  "license": "MIT"
+}

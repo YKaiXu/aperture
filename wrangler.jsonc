@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/cloudflare/workers-sdk/main/packages/wrangler/config-schema.json",
+  "name": "opencode-go-proxy",
+  "main": "src/index.js",
+  "compatibility_date": "2026-07-22",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1.0,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1.0,
+      "invocation_logs": true
+    }
+  },
+  "vars": {
+    "UPSTREAM_BASE_URL": "https://opencode.ai/zen/go/v1",
+    "AI_GATEWAY_URL": "https://gateway.ai.cloudflare.com/v1/7563e139c02b1788ac93a74d34595b1a/opencodego",
+    "CUSTOM_PROVIDER_SLUG": "opencode-go",
+    "DEFAULT_MODEL": "deepseek-v4-flash",
+    "MODEL_MAP": "{\"dv4f\":\"deepseek-v4-flash\"}",
+    "REQUEST_TIMEOUT_MS": "120000",
+    "RATE_LIMIT_MAX": "120",
+    "RATE_LIMIT_WINDOW_MS": "60000"
+  }
+}
