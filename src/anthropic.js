@@ -173,7 +173,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
   };
 
   let contentIndex = 0;
-  let hasToolUse = false;
+  let textBlockIndex = -1;        // -1 = no text block currently open
   const toolUseMap = {};
 
   for await (const chunk of streamFromResponse(upstreamResponse)) {
@@ -183,48 +183,58 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
       const toolCalls = delta.tool_calls;
       const finishReason = choice.finish_reason;
 
-      // Text content
+      // Text content: open the text block ONCE, accumulate deltas, close ONCE.
+      // Bug fix: previously every delta was wrapped in its own start/delta/stop,
+      // which made the Anthropic SDK render each token on its own line.
       if (content) {
-        yield {
-          event: "content_block_start",
-          data: {
-            type: "content_block_start",
-            index: contentIndex,
-            content_block: { type: "text", text: "" },
-          },
-        };
+        if (textBlockIndex === -1) {
+          textBlockIndex = contentIndex;
+          yield {
+            event: "content_block_start",
+            data: {
+              type: "content_block_start",
+              index: textBlockIndex,
+              content_block: { type: "text", text: "" },
+            },
+          };
+        }
         yield {
           event: "content_block_delta",
           data: {
             type: "content_block_delta",
-            index: contentIndex,
+            index: textBlockIndex,
             delta: { type: "text_delta", text: content },
           },
         };
-        yield {
-          event: "content_block_stop",
-          data: { type: "content_block_stop", index: contentIndex },
-        };
-        contentIndex++;
       }
 
-      // Tool calls
+      // Tool calls: close the open text block first, then open the tool_use block
+      // with a fresh index and accumulate its argument deltas on that index.
       if (toolCalls) {
+        if (textBlockIndex !== -1) {
+          yield {
+            event: "content_block_stop",
+            data: { type: "content_block_stop", index: textBlockIndex },
+          };
+          contentIndex++;
+          textBlockIndex = -1;
+        }
+
         for (const tc of toolCalls) {
           const fn = tc.function || {};
           const idx = tc.index;
           if (!toolUseMap[idx]) {
             toolUseMap[idx] = {
+              blockIndex: contentIndex,
               id: tc.id || uid("toolu"),
               name: fn.name || "",
               input: "",
             };
-            hasToolUse = true;
             yield {
               event: "content_block_start",
               data: {
                 type: "content_block_start",
-                index: contentIndex,
+                index: toolUseMap[idx].blockIndex,
                 content_block: {
                   type: "tool_use",
                   id: toolUseMap[idx].id,
@@ -233,6 +243,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
                 },
               },
             };
+            contentIndex++;
           }
           if (fn.name && !toolUseMap[idx].name) {
             toolUseMap[idx].name = fn.name;
@@ -243,7 +254,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
               event: "content_block_delta",
               data: {
                 type: "content_block_delta",
-                index: contentIndex,
+                index: toolUseMap[idx].blockIndex,
                 delta: { type: "input_json_delta", partial_json: fn.arguments },
               },
             };
@@ -251,18 +262,26 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
         }
       }
 
-      // Finish - emit content_block_stop for tool_use blocks
-      if (finishReason && hasToolUse) {
-        for (const idx of Object.keys(toolUseMap)) {
+      // Close any still-open tool_use blocks when the upstream signals finish.
+      if (finishReason) {
+        for (const key of Object.keys(toolUseMap)) {
+          const tc = toolUseMap[key];
           yield {
             event: "content_block_stop",
-            data: { type: "content_block_stop", index: contentIndex },
+            data: { type: "content_block_stop", index: tc.blockIndex },
           };
-          contentIndex++;
         }
-        hasToolUse = false;
+        Object.keys(toolUseMap).forEach((k) => delete toolUseMap[k]);
       }
     }
+  }
+
+  // Close any text block that was never followed by a tool call.
+  if (textBlockIndex !== -1) {
+    yield {
+      event: "content_block_stop",
+      data: { type: "content_block_stop", index: textBlockIndex },
+    };
   }
 
   // Map finish reason
