@@ -34,17 +34,19 @@ function mapModelName(model, env = {}) {
     return env.DEFAULT_MODEL || "deepseek-v4-flash";
   }
 
-  // Parse custom model map from environment
+  // Parse custom model map from environment (case-insensitive keys)
   if (env.MODEL_MAP) {
     try {
       const map = JSON.parse(env.MODEL_MAP);
-      if (map[model]) return map[model];
+      if (map[trimmed]) return map[trimmed];
     } catch {
       // ignore invalid JSON
     }
   }
 
-  return model;
+  // Fallback to default model for any unrecognized name
+  // (so clients can use any arbitrary model alias)
+  return env.DEFAULT_MODEL || "deepseek-v4-flash";
 }
 
 export default {
