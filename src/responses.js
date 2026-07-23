@@ -125,7 +125,9 @@ export function translateToChat(body) {
 
   // Token limits
   const maxTokens = body.max_output_tokens ?? body.max_tokens ?? 16384;
-  chat.max_tokens = maxTokens;
+  // Enforce a sensible minimum so reasoning models don't spend the whole budget
+  // on chain-of-thought and leave the actual answer empty.
+  chat.max_tokens = Math.max(maxTokens, 1024);
 
   // Tool/function definitions
   if (body.tools && body.tools.length > 0) {

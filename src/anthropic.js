@@ -108,6 +108,9 @@ export function translateAnthropicToChat(body) {
     if (body[src] !== undefined) chat[dst] = body[src];
   }
   if (body.max_tokens === undefined) chat.max_tokens = 8192;
+  // Enforce a sensible minimum so reasoning models don't spend the whole budget
+  // on chain-of-thought and leave the actual answer empty.
+  chat.max_tokens = Math.max(chat.max_tokens, 1024);
 
   // Tools → function calling
   if (body.tools && body.tools.length > 0) {
@@ -174,19 +177,63 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
 
   let contentIndex = 0;
   let textBlockIndex = -1;        // -1 = no text block currently open
+  let thinkingBlockIndex = -1;    // -1 = no thinking block currently open
   const toolUseMap = {};
 
   for await (const chunk of streamFromResponse(upstreamResponse)) {
     for (const choice of chunk.choices || []) {
       const delta = choice.delta || {};
       const content = delta.content;
+      const reasoning = delta.reasoning_content;   // DeepSeek reasoning model output
       const toolCalls = delta.tool_calls;
       const finishReason = choice.finish_reason;
+
+      // Thinking (reasoning) content: open ONCE, accumulate deltas, close ONCE.
+      // Anthropic protocol requires thinking blocks to appear before text blocks,
+      // so we close any open text block before opening a thinking block.
+      if (reasoning) {
+        if (textBlockIndex !== -1) {
+          yield {
+            event: "content_block_stop",
+            data: { type: "content_block_stop", index: textBlockIndex },
+          };
+          contentIndex++;
+          textBlockIndex = -1;
+        }
+        if (thinkingBlockIndex === -1) {
+          thinkingBlockIndex = contentIndex;
+          yield {
+            event: "content_block_start",
+            data: {
+              type: "content_block_start",
+              index: thinkingBlockIndex,
+              content_block: { type: "thinking", thinking: "" },
+            },
+          };
+        }
+        yield {
+          event: "content_block_delta",
+          data: {
+            type: "content_block_delta",
+            index: thinkingBlockIndex,
+            delta: { type: "thinking_delta", thinking: reasoning },
+          },
+        };
+      }
 
       // Text content: open the text block ONCE, accumulate deltas, close ONCE.
       // Bug fix: previously every delta was wrapped in its own start/delta/stop,
       // which made the Anthropic SDK render each token on its own line.
       if (content) {
+        // Close any open thinking block first (Anthropic protocol order)
+        if (thinkingBlockIndex !== -1) {
+          yield {
+            event: "content_block_stop",
+            data: { type: "content_block_stop", index: thinkingBlockIndex },
+          };
+          contentIndex++;
+          thinkingBlockIndex = -1;
+        }
         if (textBlockIndex === -1) {
           textBlockIndex = contentIndex;
           yield {
@@ -218,6 +265,14 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
           };
           contentIndex++;
           textBlockIndex = -1;
+        }
+        if (thinkingBlockIndex !== -1) {
+          yield {
+            event: "content_block_stop",
+            data: { type: "content_block_stop", index: thinkingBlockIndex },
+          };
+          contentIndex++;
+          thinkingBlockIndex = -1;
         }
 
         for (const tc of toolCalls) {
@@ -276,7 +331,14 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
     }
   }
 
-  // Close any text block that was never followed by a tool call.
+  // Close any text or thinking block that was never followed by a tool call.
+  // Close thinking first (Anthropic protocol: thinking before text).
+  if (thinkingBlockIndex !== -1) {
+    yield {
+      event: "content_block_stop",
+      data: { type: "content_block_stop", index: thinkingBlockIndex },
+    };
+  }
   if (textBlockIndex !== -1) {
     yield {
       event: "content_block_stop",
@@ -312,6 +374,14 @@ export async function translateAnthropicJson(upstreamResponse, requestId) {
   const choice = data.choices?.[0];
   const message = choice?.message || {};
   const content = [];
+
+  // Thinking (reasoning) content — must come before text per Anthropic protocol
+  if (message.reasoning_content) {
+    content.push({
+      type: "thinking",
+      thinking: message.reasoning_content,
+    });
+  }
 
   // Text content
   if (message.content) {
