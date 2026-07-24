@@ -18,6 +18,7 @@ import { sendChatRequest, extractUsage, getFinishReason } from "./upstream.js";
 export function translateAnthropicToChat(body) {
   const messages = [];
   let systemContent = null;
+  let lastAssistantIdx = null;
 
   // Extract system prompt (Anthropic puts it at top level)
   if (body.system) {
@@ -36,51 +37,66 @@ export function translateAnthropicToChat(body) {
     }
 
     if (msg.role === "user") {
-      const translated = translateAnthropicContent(msg.content);
-      messages.push({ role: "user", content: translated.text, ...(translated.images.length > 0 ? { images: translated.images } : {}) });
+      // An Anthropic user message can contain a mix of text, image, and
+      // tool_result blocks. The upstream API does NOT support role:"tool"
+      // messages, so we convert tool_result blocks into user text.
+      if (typeof msg.content === "string") {
+        messages.push({ role: "user", content: msg.content });
+      } else if (Array.isArray(msg.content)) {
+        let text = "";
+        const images = [];
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            text += block.text || "";
+          } else if (block.type === "image") {
+            if (block.source?.data) {
+              images.push({
+                type: "image_url",
+                image_url: {
+                  url: `data:${block.source.media_type || "image/png"};base64,${block.source.data}`,
+                },
+              });
+            }
+          } else if (block.type === "tool_result") {
+            // Compat mode: convert tool result to user text since the
+            // upstream API rejects role:"tool" messages.
+            const out = typeof block.content === "string"
+              ? block.content
+              : extractText(block.content);
+            text += (text ? "\n" : "") + (out || "");
+          }
+        }
+        if (text || images.length > 0) {
+          messages.push({
+            role: "user",
+            content: text,
+            ...(images.length > 0 ? { images } : {}),
+          });
+        }
+      } else {
+        messages.push({ role: "user", content: "" });
+      }
+      lastAssistantIdx = null;
       continue;
     }
 
     if (msg.role === "assistant") {
+      // Compat mode: the upstream API does NOT support tool_calls in
+      // request messages, so we strip them and only keep the text.
       const translated = translateAnthropicContent(msg.content);
-      const assistantMsg = { role: "assistant", content: translated.text };
-
-      // Handle tool_use content blocks → tool_calls
-      const toolCalls = [];
-      if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "tool_use") {
-            toolCalls.push({
-              id: block.id || uid("call"),
-              type: "function",
-              function: {
-                name: block.name || "",
-                arguments: typeof block.input === "object" ? JSON.stringify(block.input) : String(block.input || ""),
-              },
-            });
-          }
-        }
-      }
-      if (toolCalls.length > 0) {
-        assistantMsg.tool_calls = toolCalls;
-      }
-
-      messages.push(assistantMsg);
+      messages.push({ role: "assistant", content: translated.text });
       continue;
     }
 
     if (msg.role === "tool_result" || msg.role === "tool") {
-      // Anthropic tool_result → OpenAI tool message
+      // Compat mode: upstream API does not support role:"tool" messages.
+      // Convert tool results to user text.
       const content = typeof msg.content === "string" 
         ? msg.content 
         : Array.isArray(msg.content) 
           ? msg.content.map((b) => extractText(b)).join("\n")
           : "";
-      messages.push({
-        role: "tool",
-        tool_call_id: msg.tool_use_id || uid("call"),
-        content,
-      });
+      messages.push({ role: "user", content: content || "" });
     }
   }
 
