@@ -49,33 +49,11 @@ Completions)
 
 ## Key Compatibility Issues
 
-### 1. Tool Call Message Format (Most Common Cause of 400 Errors)
+### 1. Tool Call Message Format
 
-**Problem:** Trae's Builder/Agent mode generates tool call round-trips using `role: "tool"` messages in the Chat Completions request body. The upstream (Console Go / OpenCode) **rejects** `role: "tool"` messages and `tool_calls` in request messages.
+**Background:** opencode.ai uses DSML (Deep Seek Markup Language) XML-style tool calling, not standard OpenAI `tool_calls`. It natively accepts `role: "tool"` messages and `tool_calls` in assistant request messages. The Chat Completions passthrough now forwards these message formats as-is without transformation.
 
-```json
-// ❌ What Trae sends (causes 400):
-{
-  "messages": [
-    {"role": "user", "content": "What's the weather?"},
-    {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "function": {"name": "get_weather", "arguments": "{\"city\":\"Beijing\"}"}}]},
-    {"role": "tool", "tool_call_id": "call_1", "content": "Sunny, 25°C"}
-  ]
-}
-```
-
-**Fix:** `compatChatMessages()` in `src/index.js` converts these to upstream-compatible format:
-
-```json
-// ✅ What gets sent upstream (after compat):
-{
-  "messages": [
-    {"role": "user", "content": "What's the weather?"},
-    {"role": "assistant", "content": "..."},
-    {"role": "user", "content": "Sunny, 25°C"}
-  ]
-}
-```
+> **Note:** Earlier versions of this proxy included a `compatChatMessages()` function that converted `role: "tool"` to `role: "user"`. This was removed after confirming that opencode.ai properly handles the native format. If you encounter issues with tool calling, verify that your worker is running version `2c7a0e80` or later.
 
 This is the **most likely reason** Trae users see `HTTP 400` while other tools work fine.
 
@@ -158,9 +136,8 @@ curl -X POST "https://opencode-go-proxy.blogger.workers.dev/v1/chat/completions"
 
 This usually means the upstream rejected the request. Likely causes:
 
-1. **`role: "tool"` messages** — Ensure `compatChatMessages` is active (check running worker version)
-2. **AI Gateway API key** — Re-PATCH the provider with the correct `api_key`
-3. **AI Gateway base_url** — Verify it does NOT end with `/v1`
+1. **AI Gateway API key** — Re-PATCH the provider with the correct `api_key`
+2. **AI Gateway base_url** — Verify it does NOT end with `/v1`
 
 ### Error: "HTTP 200 - empty or malformed response" in Claude Code
 
@@ -188,7 +165,7 @@ curl -s "https://api.cloudflare.com/client/v4/accounts/{acct}/ai-gateway/gateway
 
 | File | Purpose |
 |------|---------|
-| `src/index.js` | `compatChatMessages()`, `filterChatStream()`, routing |
+| `src/index.js` | `filterChatStream()`, routing, passthrough |
 | `src/upstream.js` | `buildUpstreamUrl()`, `chooseApiKey()` — Gateway routing logic |
 | `src/anthropic.js` | Anthropic stream translation with `reasoning_content` → `thinking` |
 | `wrangler.jsonc` | Worker configuration, model mapping, env vars |
@@ -199,7 +176,8 @@ curl -s "https://api.cloudflare.com/client/v4/accounts/{acct}/ai-gateway/gateway
 Relevant commits for Trae compatibility:
 
 ```
-3cac3f2 - fix: add compatChatMessages for Chat Completions passthrough
+2c7a0e80 - fix: remove compatChatMessages (opencode.ai natively supports role:tool)
+3cac3f2 - fix: add compatChatMessages for Chat Completions passthrough [REVERTED]
 785ce57 - fix: improve upstream routing and error diagnostics
 9ed948f - fix: filter reasoning_content for Trae compat + stop_reason mapping + null body guard
 ```
