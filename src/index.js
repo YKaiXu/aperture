@@ -124,6 +124,73 @@ function detectRoute(path, body) {
 // ─── Chat Completions Passthrough ──────────────────────
 
 /**
+ * Pipe an async generator of event objects to a SSE Response.
+ * Each event object should have { event, data } properties.
+ * Shared across Chat/Responses/Anthropic streaming handlers.
+ */
+function pipeEventStream(stream, extraHeaders = {}) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  (async () => {
+    try {
+      for await (const { event, data } of stream) {
+        const raw = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+        await writer.write(encoder.encode(raw));
+      }
+    } catch (err) {
+      try {
+        await writer.write(
+          encoder.encode(`event: error\ndata: {"type":"error","error":{"message":"Internal error"}}\n\n`)
+        );
+      } catch { /* ignore */ }
+    } finally {
+      try { await writer.close(); } catch { /* ignore */ }
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      ...extraHeaders,
+      ...corsHeaders(),
+    },
+  });
+}
+
+/**
+ * Pipe filtered SSE lines to a Response for Chat Completions streaming.
+ */
+function pipeChatStream(stream) {
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
+
+  (async () => {
+    try {
+      for await (const line of stream) {
+        await writer.write(encoder.encode(line + "\n"));
+      }
+    } catch { /* ignore write errors if client disconnected */ }
+    finally {
+      try { await writer.close(); } catch { /* ignore */ }
+    }
+  })();
+
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      ...corsHeaders(),
+    },
+  });
+}
+
+/**
  * Filter streaming SSE chunks to strip non-standard fields that some clients
  * (e.g. Trae IDE) cannot handle.
  *
@@ -212,31 +279,7 @@ async function handleChatCompletions(body, env) {
 
   // Stream passthrough (with reasoning_content filter for broader compatibility)
   if (body.stream) {
-    // Use TransformStream to pipe filtered SSE to the client
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    (async () => {
-      try {
-        for await (const line of filterChatStream(upstreamResponse)) {
-          await writer.write(encoder.encode(line + "\n"));
-        }
-      } catch (err) {
-        // Ignore write errors if client disconnected
-      } finally {
-        try { await writer.close(); } catch { /* ignore */ }
-      }
-    })();
-
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        ...corsHeaders(),
-      },
-    });
+    return pipeChatStream(filterChatStream(upstreamResponse));
   }
 
   // Non-streaming: normalize DSML tool calls and return
@@ -283,37 +326,7 @@ async function handleResponsesAPI(body, env) {
 
   // Streaming
   if (chatReq.stream) {
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    (async () => {
-      try {
-        for await (const event of translateStreamEvents(upstreamResponse, respId)) {
-          const raw = `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`;
-          await writer.write(encoder.encode(raw));
-        }
-      } catch (err) {
-        try {
-          await writer.write(
-            encoder.encode(`event: error\ndata: {"type":"error","error":{"message":"Internal error"}}\n\n`)
-          );
-        } catch {
-          // ignore
-        }
-      } finally {
-        try { await writer.close(); } catch { /* ignore */ }
-      }
-    })();
-
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        ...corsHeaders(),
-      },
-    });
+    return pipeEventStream(translateStreamEvents(upstreamResponse, respId));
   }
 
   // Non-streaming
@@ -361,38 +374,9 @@ async function handleAnthropicMessages(body, env) {
 
   // Streaming
   if (chatReq.stream) {
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    (async () => {
-      try {
-        for await (const event of translateAnthropicStream(upstreamResponse, requestId)) {
-          const raw = `event: ${event.event}\ndata: ${JSON.stringify(event.data)}\n\n`;
-          await writer.write(encoder.encode(raw));
-        }
-      } catch (err) {
-        try {
-          await writer.write(
-            encoder.encode(`event: error\ndata: {"type":"error","error":{"message":"Internal error"}}\n\n`)
-          );
-        } catch {
-          // ignore
-        }
-      } finally {
-        try { await writer.close(); } catch { /* ignore */ }
-      }
-    })();
-
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        "x-request-id": requestId,
-        "request-id": requestId,
-        ...corsHeaders(),
-      },
+    return pipeEventStream(translateAnthropicStream(upstreamResponse, requestId), {
+      "x-request-id": requestId,
+      "request-id": requestId,
     });
   }
 

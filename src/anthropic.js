@@ -37,9 +37,8 @@ export function translateAnthropicToChat(body) {
     }
 
     if (msg.role === "user") {
-      // An Anthropic user message can contain a mix of text, image, and
-      // tool_result blocks. The upstream API does NOT support role:"tool"
-      // messages, so we convert tool_result blocks into user text.
+      // A user message can contain text, image, and tool_result blocks.
+      // tool_result blocks are converted to user text for upstream compatibility.
       if (typeof msg.content === "string") {
         messages.push({ role: "user", content: msg.content });
       } else if (Array.isArray(msg.content)) {
@@ -81,16 +80,13 @@ export function translateAnthropicToChat(body) {
     }
 
     if (msg.role === "assistant") {
-      // Compat mode: the upstream API does NOT support tool_calls in
-      // request messages, so we strip them and only keep the text.
       const translated = translateAnthropicContent(msg.content);
       messages.push({ role: "assistant", content: translated.text });
       continue;
     }
 
     if (msg.role === "tool_result" || msg.role === "tool") {
-      // Compat mode: upstream API does not support role:"tool" messages.
-      // Convert tool results to user text.
+      // Convert tool results to user text for upstream compatibility.
       const content = typeof msg.content === "string" 
         ? msg.content 
         : Array.isArray(msg.content) 

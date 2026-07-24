@@ -9,17 +9,18 @@
 
 import { fetchUpstream } from "./utils.js";
 
+/**
+ * Check if AI Gateway mode is active.
+ */
+function isGatewayMode(env) {
+  return (env.AI_GATEWAY_URL || "").trim().length > 0;
+}
+
 function buildUpstreamUrl(env) {
-  // AI Gateway: routes through CF AI Gateway (adds caching, analytics, retries)
-  // Only active when AI_GATEWAY_URL is non-empty.
-  const gwUrl = env.AI_GATEWAY_URL || "";
-  if (gwUrl.trim()) {
-    const base = gwUrl.replace(/\/+$/, "");
+  if (isGatewayMode(env)) {
+    const base = env.AI_GATEWAY_URL.replace(/\/+$/, "");
     const slug = env.CUSTOM_PROVIDER_SLUG || "";
-    if (slug) {
-      return `${base}/custom-${slug}/v1/chat/completions`;
-    }
-    return `${base}/chat/completions`;
+    return slug ? `${base}/custom-${slug}/v1/chat/completions` : `${base}/chat/completions`;
   }
   // Direct/transit route
   const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
@@ -28,12 +29,11 @@ function buildUpstreamUrl(env) {
 
 /**
  * Choose the API key for upstream requests.
- * - Gateway mode (AI_GATEWAY_URL set): use Gateway token (cfut)
- * - Direct/transit mode: use OPENCODE_API_KEY
+ * - Gateway mode: use Gateway token (cfut)
+ * - Direct mode: use OPENCODE_API_KEY
  */
 function chooseApiKey(env) {
-  const gwUrl = env.AI_GATEWAY_URL || "";
-  if (gwUrl.trim()) {
+  if (isGatewayMode(env)) {
     return env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
   }
   return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
@@ -70,8 +70,7 @@ export async function sendChatRequest(env, chatBody) {
   // --- Fallback: Gateway 400 → retry directly to Console Go ---
   // Gateway occasionally returns 400 with empty body (stored key issue).
   // Direct Console Go always works, so fallback to it.
-  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
-  if (!gwUrl) return response; // already in direct mode
+  if (!isGatewayMode(env)) return response; // already in direct mode
 
   const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
   const fallbackApiKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
