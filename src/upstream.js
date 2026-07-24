@@ -46,17 +46,53 @@ function chooseApiKey(env) {
  * When routing directly, sends the upstream API key.
  */
 export async function sendChatRequest(env, chatBody) {
-  const url = buildUpstreamUrl(env);
+  // Try primary route (Gateway or direct based on config)
+  const primaryUrl = buildUpstreamUrl(env);
   const timeout = parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10);
-  const apiKey = chooseApiKey(env);
+  const primaryApiKey = chooseApiKey(env);
 
-  return fetchUpstream(
-    url,
+  const response = await fetchUpstream(
+    primaryUrl,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
+        Authorization: `Bearer ${primaryApiKey}`,
+      },
+      body: JSON.stringify(chatBody),
+    },
+    timeout
+  );
+
+  // If primary route succeeds or is not a 400 (client error), return as-is
+  if (response.ok || response.status !== 400) return response;
+
+  // --- Fallback: Gateway 400 → retry directly to Console Go ---
+  // This handles intermittent issues with the Gateway's stored API key.
+  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
+  if (!gwUrl) return response; // already in direct mode, nothing to fallback to
+
+  // Read the error body to confirm it's a Console Go error
+  try {
+    const errBody = await response.clone().text();
+    if (!errBody.includes("Console Go")) return response; // not a Console Go error, don't retry
+  } catch {
+    return response; // can't read body, don't retry
+  }
+
+  // Build fallback URL and API key for direct route
+  const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
+  const fallbackApiKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
+
+  console.log(`Gateway 400 → falling back to direct: ${fallbackUrl}`);
+
+  return fetchUpstream(
+    fallbackUrl,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${fallbackApiKey}`,
       },
       body: JSON.stringify(chatBody),
     },
