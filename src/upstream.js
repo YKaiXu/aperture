@@ -7,24 +7,36 @@
 // 3. API Key: your OpenCode API key
 // 4. Then set AI_GATEWAY_URL env var to enable routing through the gateway
 
-import { fetchUpstream, getUpstreamApiKey } from "./utils.js";
+import { fetchUpstream } from "./utils.js";
 
 function buildUpstreamUrl(env) {
   // AI Gateway: routes through CF AI Gateway (adds caching, analytics, retries)
-  if (env.AI_GATEWAY_URL) {
-    const base = env.AI_GATEWAY_URL.replace(/\/+$/, "");
-    // Custom provider path: /custom-{slug}/v1/chat/completions
-    // The Gateway appends this path to the provider's base_url
+  // Only active when AI_GATEWAY_URL is non-empty.
+  const gwUrl = env.AI_GATEWAY_URL || "";
+  if (gwUrl.trim()) {
+    const base = gwUrl.replace(/\/+$/, "");
     const slug = env.CUSTOM_PROVIDER_SLUG || "";
     if (slug) {
       return `${base}/custom-${slug}/v1/chat/completions`;
     }
-    // If no slug, try the base URL as-is (user provided full path)
     return `${base}/chat/completions`;
   }
-  // Direct route
+  // Direct/transit route
   const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
   return `${baseUrl}/chat/completions`;
+}
+
+/**
+ * Choose the API key for upstream requests.
+ * - Gateway mode (AI_GATEWAY_URL set): use Gateway token (cfut)
+ * - Direct/transit mode: use OPENCODE_API_KEY
+ */
+function chooseApiKey(env) {
+  const gwUrl = env.AI_GATEWAY_URL || "";
+  if (gwUrl.trim()) {
+    return env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
+  }
+  return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 }
 
 /**
@@ -36,13 +48,7 @@ function buildUpstreamUrl(env) {
 export async function sendChatRequest(env, chatBody) {
   const url = buildUpstreamUrl(env);
   const timeout = parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10);
-
-  // When using AI Gateway, send the Gateway token (cfut) for authentication.
-  // The Gateway's custom provider stores the OpenCode API key internally.
-  // When routing directly, use the upstream API key (OPENCODE_API_KEY).
-  const apiKey = env.AI_GATEWAY_URL
-    ? (env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY)
-    : getUpstreamApiKey(env);
+  const apiKey = chooseApiKey(env);
 
   return fetchUpstream(
     url,
@@ -56,6 +62,13 @@ export async function sendChatRequest(env, chatBody) {
     },
     timeout
   );
+}
+
+/**
+ * Get the upstream URL that would be used (for diagnostics).
+ */
+export function getUpstreamUrl(env) {
+  return buildUpstreamUrl(env);
 }
 
 export function extractUsage(upstreamData) {

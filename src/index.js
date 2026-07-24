@@ -11,7 +11,7 @@
 //   x-api-key: <token>             (Anthropic style)
 
 import { uid, now, errorResponse, corsHeaders, authenticate, withTimeout, createRateLimiter } from "./utils.js";
-import { sendChatRequest } from "./upstream.js";
+import { sendChatRequest, getUpstreamUrl } from "./upstream.js";
 import { translateToChat, translateStreamEvents, translateResponseJson } from "./responses.js";
 import { translateAnthropicToChat, translateAnthropicStream, translateAnthropicJson } from "./anthropic.js";
 
@@ -204,7 +204,9 @@ async function handleChatCompletions(body, env) {
 
   const upstreamResponse = await sendChatRequest(env, body);
   if (!upstreamResponse.ok) {
-    const errMsg = await readUpstreamErrorSafe(upstreamResponse);
+    const upstreamUrl = getUpstreamUrl(env);
+    const upstreamBody = await safeReadUpstreamBody(upstreamResponse);
+    const errMsg = `Upstream returned ${upstreamResponse.status} - URL: ${upstreamUrl} - Body: ${upstreamBody}`;
     return errorResponse(errMsg, "upstream_error", "UPSTREAM", upstreamResponse.status);
   }
 
@@ -411,5 +413,17 @@ async function readUpstreamErrorSafe(response) {
     return body.error?.message || body.message || `Upstream returned ${response.status}`;
   } catch {
     return `Upstream returned ${response.status}`;
+  }
+}
+
+/**
+ * Safely read upstream error response body for diagnostic purposes.
+ */
+async function safeReadUpstreamBody(response) {
+  try {
+    const text = await response.text();
+    return (text || "(empty)").slice(0, 500);
+  } catch {
+    return "(unreadable)";
   }
 }
