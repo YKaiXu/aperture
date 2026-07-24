@@ -400,6 +400,8 @@ export async function translateResponseJson(upstreamResponse, respId) {
 // ─── Internal helpers ──────────────────────────────
 
 async function* streamFromUpstream(response) {
+  // Guard against empty response body
+  if (!response.body) return;
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   while (true) {

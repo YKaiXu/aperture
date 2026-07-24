@@ -141,6 +141,7 @@ export async function readUpstreamError(response) {
  * Convert a ReadableStream to an async iterable of SSE events.
  */
 export async function* streamSSE(response) {
+  if (!response.body) return;
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   while (true) {

@@ -195,14 +195,22 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
   let textBlockIndex = -1;        // -1 = no text block currently open
   let thinkingBlockIndex = -1;    // -1 = no thinking block currently open
   const toolUseMap = {};
+  let lastFinishReason = null;
+  const streamUsage = { input_tokens: 0, output_tokens: 0 };
 
   for await (const chunk of streamFromResponse(upstreamResponse)) {
+    // Track usage from chunks (some providers emit usage in the final chunk)
+    if (chunk.usage) {
+      streamUsage.input_tokens = chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0;
+      streamUsage.output_tokens = chunk.usage.completion_tokens ?? chunk.usage.output_tokens ?? 0;
+    }
     for (const choice of chunk.choices || []) {
       const delta = choice.delta || {};
       const content = delta.content;
       const reasoning = delta.reasoning_content;   // DeepSeek reasoning model output
       const toolCalls = delta.tool_calls;
       const finishReason = choice.finish_reason;
+      if (finishReason) lastFinishReason = finishReason;
 
       // Thinking (reasoning) content: open ONCE, accumulate deltas, close ONCE.
       // Anthropic protocol requires thinking blocks to appear before text blocks,
@@ -362,17 +370,15 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
     };
   }
 
-  // Map finish reason
-  let stopReason = "end_turn";
-  // Check last finish reason from chunks (simplified)
-  const usage = { input_tokens: 0, output_tokens: 0 };
+  // Map finish reason from the tracked last finish reason
+  const stopReason = lastFinishReason ? mapFinishReason(lastFinishReason) : "end_turn";
 
   yield {
     event: "message_delta",
     data: {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: usage.output_tokens },
+      usage: { output_tokens: streamUsage.output_tokens },
     },
   };
 
@@ -511,6 +517,8 @@ function translateAnthropicContent(content) {
 }
 
 async function* streamFromResponse(response) {
+  // Guard against empty response body (e.g., AI Gateway returning 200 with no body)
+  if (!response.body) return;
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   while (true) {

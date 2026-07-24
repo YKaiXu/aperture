@@ -123,6 +123,81 @@ function detectRoute(path, body) {
 
 // ─── Chat Completions Passthrough ──────────────────────
 
+/**
+ * Filter streaming SSE chunks to strip non-standard fields that some clients
+ * (e.g. Trae IDE) cannot handle.
+ *
+ * DeepSeek models emit `reasoning_content` in streaming delta chunks.
+ * Standard OpenAI Chat Completions clients may choke on this field.
+ * This filter removes `reasoning_content` and skips chunks that only
+ * contain reasoning (no actual content delta).
+ */
+async function* filterChatStream(upstreamResponse) {
+  const reader = upstreamResponse.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += value;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      // Pass through non-data lines (e.g. empty line separators, event: lines)
+      if (!trimmed.startsWith("data: ")) {
+        yield line;
+        continue;
+      }
+      const payload = trimmed.slice(6).trim();
+      // Pass through [DONE] signal unchanged
+      if (payload === "[DONE]") {
+        yield line;
+        continue;
+      }
+      // Try to parse and filter reasoning_content
+      let parsed;
+      try {
+        parsed = JSON.parse(payload);
+      } catch {
+        yield line; // malformed JSON — pass through
+        continue;
+      }
+      if (!parsed.choices || !Array.isArray(parsed.choices)) {
+        yield line; // no choices — pass through
+        continue;
+      }
+      let modified = false;
+      for (const choice of parsed.choices) {
+        if (!choice.delta) continue;
+        // Strip reasoning_content (DeepSeek non-standard field)
+        if (choice.delta.reasoning_content !== undefined) {
+          delete choice.delta.reasoning_content;
+          modified = true;
+        }
+        // Convert content: null → "" (some clients expect string content)
+        if (choice.delta.content === null) {
+          choice.delta.content = "";
+          modified = true;
+        }
+      }
+      if (!modified) {
+        yield line; // nothing changed — pass through
+        continue;
+      }
+      // Keep the chunk if:
+      // 1. Any choice has non-empty delta content (including role), OR
+      // 2. Any choice has a finish_reason (stream end signal)
+      const hasContent = parsed.choices.some(c =>
+        (c.delta && Object.keys(c.delta).length > 0) || c.finish_reason
+      );
+      if (hasContent) {
+        yield `data: ${JSON.stringify(parsed)}`;
+      }
+      // If delta is entirely empty after stripping, skip the chunk
+    }
+  }
+}
+
 async function handleChatCompletions(body, env) {
   // Override model and passthrough
   body.model = mapModelName(body.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
@@ -133,9 +208,26 @@ async function handleChatCompletions(body, env) {
     return errorResponse(errMsg, "upstream_error", "UPSTREAM", upstreamResponse.status);
   }
 
-  // Stream passthrough
+  // Stream passthrough (with reasoning_content filter for broader compatibility)
   if (body.stream) {
-    return new Response(upstreamResponse.body, {
+    // Use TransformStream to pipe filtered SSE to the client
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+
+    (async () => {
+      try {
+        for await (const line of filterChatStream(upstreamResponse)) {
+          await writer.write(encoder.encode(line + "\n"));
+        }
+      } catch (err) {
+        // Ignore write errors if client disconnected
+      } finally {
+        try { await writer.close(); } catch { /* ignore */ }
+      }
+    })();
+
+    return new Response(readable, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
@@ -228,6 +320,16 @@ async function handleResponsesAPI(body, env) {
 
 // ─── Anthropic Messages API Handler ───────────────────
 
+function anthropicHeaders(extra = {}) {
+  return {
+    "Content-Type": "application/json",
+    "x-request-id": uid("req"),
+    "request-id": uid("req"),
+    ...extra,
+    ...corsHeaders(),
+  };
+}
+
 async function handleAnthropicMessages(body, env) {
   const requestId = uid("msg");
 
@@ -247,7 +349,7 @@ async function handleAnthropicMessages(body, env) {
       }),
       {
         status: upstreamResponse.status,
-        headers: { "Content-Type": "application/json", ...corsHeaders() },
+        headers: anthropicHeaders(),
       }
     );
   }
@@ -282,6 +384,8 @@ async function handleAnthropicMessages(body, env) {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
         Connection: "keep-alive",
+        "x-request-id": requestId,
+        "request-id": requestId,
         ...corsHeaders(),
       },
     });
@@ -290,7 +394,12 @@ async function handleAnthropicMessages(body, env) {
   // Non-streaming
   const result = await translateAnthropicJson(upstreamResponse, requestId);
   return new Response(JSON.stringify(result), {
-    headers: { "Content-Type": "application/json", ...corsHeaders() },
+    headers: {
+      "Content-Type": "application/json",
+      "x-request-id": requestId,
+      "request-id": requestId,
+      ...corsHeaders(),
+    },
   });
 }
 
