@@ -239,7 +239,10 @@ async function handleChatCompletions(body, env) {
     });
   }
 
-  return new Response(upstreamResponse.body, {
+  // Non-streaming: normalize DSML tool calls and return
+  const responseBody = await upstreamResponse.json();
+  const normalizedBody = normalizeDsmlToolCalls(responseBody);
+  return new Response(JSON.stringify(normalizedBody), {
     status: upstreamResponse.status,
     headers: {
       "Content-Type": "application/json",
@@ -406,6 +409,83 @@ async function handleAnthropicMessages(body, env) {
 }
 
 // ─── Internal Helpers ─────────────────────────────────
+
+/**
+ * Detect and convert Console Go DSML tool calls to standard OpenAI tool_calls format.
+ * 
+ * Console Go sometimes returns tool calls as DSML XML embedded in the content text
+ * (with finish_reason: "stop") instead of standard message.tool_calls format.
+ * This function detects this pattern and normalizes it.
+ */
+function normalizeDsmlToolCalls(responseBody) {
+  if (!responseBody?.choices?.[0]?.message) return responseBody;
+  const choice = responseBody.choices[0];
+  const msg = choice.message;
+  const content = msg.content || "";
+
+  // Check if content contains DSML tool call pattern
+  // DSML format: <...DSML...tool_calls> (tool_calls inside the tag)
+  // Use multiple detection methods for robustness
+  const dsmlDetect = (
+    content.includes("DSML") && 
+    (content.includes("tool_calls") || content.includes("invoke name"))
+  );
+  if (!dsmlDetect) return responseBody;
+
+  // Extract tool calls from DSML - try multiple regex patterns
+  const toolCalls = [];
+  
+  // Pattern 1: <...DSML...> invoke name="funcName"
+  let invokeRe = /DSML[^>]*>\s*invoke\s+name\s*=\s*"([^"]+)"/gi;
+  let invokeMatches = [...content.matchAll(invokeRe)];
+  
+  // Pattern 2: Fallback: simple "invoke name=" extraction  
+  if (invokeMatches.length === 0) {
+    const simpleRe = /invoke\s+name\s*=\s*"([^"]+)"/gi;
+    invokeMatches = [...content.matchAll(simpleRe)];
+  }
+  
+  // Pattern 1 for parameters
+  let paramRe = /DSML[^>]*>\s*parameter\s+name\s*=\s*"([^"]+)"[^>]*>([^<]*)<\//gi;
+  let paramMatches = [...content.matchAll(paramRe)];
+  
+  // Fallback: simple parameter extraction
+  if (paramMatches.length === 0) {
+    const simpleParamRe = /parameter\s+name\s*=\s*"([^"]+)"[^>]*>([^<]*)<\//gi;
+    paramMatches = [...content.matchAll(simpleParamRe)];
+  }
+
+  let callIndex = 0;
+  for (const invokeMatch of invokeMatches) {
+    const fnName = invokeMatch[1];
+    const args = {};
+    for (const p of paramMatches) {
+      if (p[1]) args[p[1]] = p[2] || "";
+    }
+
+    toolCalls.push({
+      index: callIndex,
+      id: `call_dsml_${uid("")}`,
+      type: "function",
+      function: {
+        name: fnName,
+        arguments: JSON.stringify(args),
+      },
+    });
+    callIndex++;
+  }
+
+  if (toolCalls.length === 0) return responseBody;
+
+  // Build cleaned response
+  msg.content = ""; // DSML content replaced with empty string
+  msg.tool_calls = toolCalls;
+  if (choice.finish_reason === "stop" || choice.finish_reason === "length") {
+    choice.finish_reason = "tool_calls";
+  }
+
+  return responseBody;
+}
 
 async function readUpstreamErrorSafe(response) {
   try {
