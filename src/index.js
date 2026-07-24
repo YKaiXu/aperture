@@ -36,15 +36,22 @@ export default {
       return new Response(null, { headers: corsHeaders() });
     }
 
+    const url = new URL(request.url);
+    const path = url.pathname;
+
+    // ── Model discovery (GET /v1/models) ────────────────
+    // AI clients (e.g. Trae) query this endpoint to discover available models.
+    if (request.method === "GET" && path === "/v1/models") {
+      log.info("models.discovery");
+      return handleModelDiscovery(env);
+    }
+
     if (request.method !== "POST") {
-      log.warn("method.not_allowed", { method: request.method });
+      log.warn("method.not_allowed", { method: request.method, path });
       return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
     }
 
-    log.info("request.received", {
-      method: "POST",
-      path: new URL(request.url).pathname,
-    });
+    log.info("request.received", { method: "POST", path });
 
     // ── Authentication ─────────────────────────────────
     const auth = authenticate(request, env);
@@ -66,7 +73,6 @@ export default {
 
     // ── Extract auth header for forwarding to upstream ──
     // ── Route detection ────────────────────────────────
-    const path = new URL(request.url).pathname;
     const route = detectRoute(path, body);
     log.info("route.detected", { route, path });
 
@@ -103,6 +109,37 @@ function detectRoute(path, body) {
 
   // Default: treat as Responses API
   return "responses";
+}
+
+// ─── Model Discovery ───────────────────────────────────
+
+/**
+ * Handle GET /v1/models — return available models for client discovery.
+ * AI clients (Trae, Open WebUI, etc.) call this to populate model lists.
+ */
+function handleModelDiscovery(env) {
+  // Claude Code/Desktop 只认 claude-* 或 anthropic/claude-* 开头的模型名。
+  // 返回多个 Claude 兼容名称让客户端通过校验。
+  // 注意：Worker 的 resolveModel() 会忽略客户端选的模型，
+  // 永远转发的都是 DEFAULT_MODEL，所以这里返回什么名字都可以。
+  const names = [
+    "claude-sonnet-4-20250514",
+    "claude-sonnet-4",
+    "claude-3-5-sonnet-latest",
+    "claude-3-haiku",
+    "claude-3-opus",
+  ];
+
+  const models = names.map((id) => ({
+    id,
+    object: "model",
+    created: 1700000000,
+    owned_by: "aperture",
+  }));
+
+  return new Response(JSON.stringify({ object: "list", data: models }), {
+    headers: { "Content-Type": "application/json", ...corsHeaders() },
+  });
 }
 
 // ─── Chat Completions Passthrough ──────────────────────
@@ -273,7 +310,7 @@ async function handleAnthropicMessages(body, env, log) {
   // Translate Anthropic request → Chat Completions
   const chatReq = translateAnthropicToChat(body);
   chatReq.model = resolveModel(chatReq.model, env);
-  log.info("anthropic.translated", { requestId, model: chatReq.model, stream: !!chatReq.stream });
+  log.info("anthropic.translated", { requestId, model: chatReq.model, stream: chatReq.stream });
 
   const upstreamResponse = await sendChatRequest(env, chatReq, log);
   if (!upstreamResponse.ok) {

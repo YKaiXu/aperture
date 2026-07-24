@@ -57,8 +57,8 @@ export function translateAnthropicToChat(body) {
               });
             }
           } else if (block.type === "tool_result") {
-            // Compat mode: convert tool result to user text since the
-            // upstream API rejects role:"tool" messages.
+            // Convert tool result to user text (upstream Console Go
+            // doesn't support role: "tool" in multi-turn conversations).
             const out = typeof block.content === "string"
               ? block.content
               : extractText(block.content);
@@ -112,7 +112,8 @@ export function translateAnthropicToChat(body) {
     }
 
     if (msg.role === "tool_result" || msg.role === "tool") {
-      // Convert tool results to user text for upstream compatibility.
+      // Convert tool results to user text (upstream Console Go
+      // doesn't support role: "tool" in multi-turn conversations).
       const content = typeof msg.content === "string" 
         ? msg.content 
         : Array.isArray(msg.content) 
@@ -127,11 +128,21 @@ export function translateAnthropicToChat(body) {
     messages.unshift({ role: "system", content: systemContent.trim() });
   }
 
+  // Upstream (Console Go) doesn't support tool_calls in conversation history.
+  // Since tool results have been converted to user text, we must also strip
+  // tool_calls from assistant messages to avoid 400 errors on multi-turn
+  // conversations that include tool interactions.
+  for (const m of messages) {
+    delete m.tool_calls;
+  }
+
   // Build chat request
+  // Note: stream defaults to false. The caller (handleAnthropicMessages)
+  // should set stream: true if the client requested SSE via Accept header.
   const chat = {
     model: translateModel(body.model),
     messages,
-    stream: body.stream !== false,
+    stream: body.stream === true,
   };
 
   // Copy parameters
@@ -330,40 +341,68 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
           const fn = tc.function || {};
           const idx = tc.index;
           if (!toolUseMap[idx]) {
+            // Some providers (e.g. Console Go / OpenCode) never set
+            // function.name or id — the function name is embedded inside
+            // the arguments JSON. We buffer and defer content_block_start
+            // until we can extract the name from arguments.
             toolUseMap[idx] = {
-              blockIndex: contentIndex,
-              id: tc.id || uid("toolu"),
+              blockIndex: -1,   // not yet assigned
+              id: tc.id || "",
               name: fn.name || "",
               input: "",
+              started: false,   // content_block_start not yet emitted
             };
-            yield {
-              event: "content_block_start",
-              data: {
-                type: "content_block_start",
-                index: toolUseMap[idx].blockIndex,
-                content_block: {
-                  type: "tool_use",
-                  id: toolUseMap[idx].id,
-                  name: toolUseMap[idx].name,
-                  input: {},
-                },
-              },
-            };
-            contentIndex++;
           }
-          if (fn.name && !toolUseMap[idx].name) {
-            toolUseMap[idx].name = fn.name;
-          }
+
           if (fn.arguments) {
             toolUseMap[idx].input += fn.arguments;
-            yield {
-              event: "content_block_delta",
-              data: {
-                type: "content_block_delta",
-                index: toolUseMap[idx].blockIndex,
-                delta: { type: "input_json_delta", partial_json: fn.arguments },
-              },
-            };
+
+            // If we haven't emitted content_block_start yet and now have
+            // enough data, try to extract the name from arguments JSON.
+            if (!toolUseMap[idx].started) {
+              // Extract id from arguments if not provided separately
+              if (!toolUseMap[idx].id) {
+                const idMatch = toolUseMap[idx].input.match(/"id"\s*:\s*"([^"]+)"/);
+                if (idMatch) toolUseMap[idx].id = idMatch[1];
+              }
+              // Extract name from arguments JSON (e.g. {"name":"web_search",...})
+              if (!toolUseMap[idx].name) {
+                const nameMatch = toolUseMap[idx].input.match(/"name"\s*:\s*"([^"]+)"/);
+                if (nameMatch) toolUseMap[idx].name = nameMatch[1];
+              }
+              // Only emit content_block_start once we have the name (or enough input)
+              if (toolUseMap[idx].name || toolUseMap[idx].input.length > 50) {
+                toolUseMap[idx].blockIndex = contentIndex;
+                toolUseMap[idx].id = toolUseMap[idx].id || uid("toolu");
+                toolUseMap[idx].started = true;
+                yield {
+                  event: "content_block_start",
+                  data: {
+                    type: "content_block_start",
+                    index: toolUseMap[idx].blockIndex,
+                    content_block: {
+                      type: "tool_use",
+                      id: toolUseMap[idx].id,
+                      name: toolUseMap[idx].name || toolUseMap[idx].id,
+                      input: {},
+                    },
+                  },
+                };
+                contentIndex++;
+              }
+            }
+
+            // Emit delta only after content_block_start has been sent
+            if (toolUseMap[idx].started) {
+              yield {
+                event: "content_block_delta",
+                data: {
+                  type: "content_block_delta",
+                  index: toolUseMap[idx].blockIndex,
+                  delta: { type: "input_json_delta", partial_json: fn.arguments },
+                },
+              };
+            }
           }
         }
       }
@@ -372,6 +411,33 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
       if (finishReason) {
         for (const key of Object.keys(toolUseMap)) {
           const tc = toolUseMap[key];
+          // If content_block_start was never emitted, force-emit it now
+          // with name extracted from arguments.
+          if (!tc.started) {
+            tc.id = tc.id || uid("toolu");
+            if (!tc.name && tc.input) {
+              try {
+                const parsed = JSON.parse(tc.input);
+                if (parsed.name) tc.name = parsed.name;
+              } catch {}
+            }
+            tc.blockIndex = contentIndex;
+            tc.started = true;
+            yield {
+              event: "content_block_start",
+              data: {
+                type: "content_block_start",
+                index: tc.blockIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: tc.id,
+                  name: tc.name || tc.id,
+                  input: {},
+                },
+              },
+            };
+            contentIndex++;
+          }
           yield {
             event: "content_block_stop",
             data: { type: "content_block_stop", index: tc.blockIndex },
