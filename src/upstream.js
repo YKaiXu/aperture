@@ -68,23 +68,15 @@ export async function sendChatRequest(env, chatBody) {
   if (response.ok || response.status !== 400) return response;
 
   // --- Fallback: Gateway 400 → retry directly to Console Go ---
-  // This handles intermittent issues with the Gateway's stored API key.
+  // Gateway occasionally returns 400 with empty body (stored key issue).
+  // Direct Console Go always works, so fallback to it.
   const gwUrl = (env.AI_GATEWAY_URL || "").trim();
-  if (!gwUrl) return response; // already in direct mode, nothing to fallback to
+  if (!gwUrl) return response; // already in direct mode
 
-  // Read the error body to confirm it's a Console Go error
-  try {
-    const errBody = await response.clone().text();
-    if (!errBody.includes("Console Go")) return response; // not a Console Go error, don't retry
-  } catch {
-    return response; // can't read body, don't retry
-  }
-
-  // Build fallback URL and API key for direct route
   const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
   const fallbackApiKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 
-  console.log(`Gateway 400 → falling back to direct: ${fallbackUrl}`);
+  console.log(`Gateway 400 → fallback to direct: ${fallbackUrl}`);
 
   return fetchUpstream(
     fallbackUrl,
