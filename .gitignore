@@ -6,6 +6,7 @@ node_modules/
 *.log
 wrangler.toml
 .wrangler/
-tests/vitest-out.txt
-tests/test-request*.json
+tests/
+CODEBUDDY.md
+vitest.config.mjs
 aperture-code-review-report.md
