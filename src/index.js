@@ -198,9 +198,38 @@ async function* filterChatStream(upstreamResponse) {
   }
 }
 
+/**
+ * Convert request messages to compat format for upstreams that don't support
+ * role:"tool" messages or tool_calls in request messages (e.g. Console Go / OpenCode).
+ *
+ * - role:"tool" messages → role:"user" messages (with tool result as text)
+ * - tool_calls in assistant messages → stripped (only text kept)
+ */
+function compatChatMessages(messages) {
+  if (!messages || !Array.isArray(messages)) return messages;
+  const result = [];
+  for (const msg of messages) {
+    if (msg.role === "tool") {
+      const content = typeof msg.content === "string" ? msg.content : "";
+      result.push({ role: "user", content: content || "(tool result)" });
+    } else if (msg.role === "assistant" && msg.tool_calls) {
+      const text = msg.content || "";
+      result.push({ role: "assistant", content: text || "..." });
+    } else {
+      result.push(msg);
+    }
+  }
+  return result;
+}
+
 async function handleChatCompletions(body, env) {
   // Override model and passthrough
   body.model = mapModelName(body.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+
+  // Apply compat mode for upstreams that don't support role:"tool" messages
+  if (body.messages) {
+    body.messages = compatChatMessages(body.messages);
+  }
 
   const upstreamResponse = await sendChatRequest(env, body);
   if (!upstreamResponse.ok) {
