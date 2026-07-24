@@ -46,7 +46,6 @@ function chooseApiKey(env) {
  * When routing directly, sends the upstream API key.
  */
 export async function sendChatRequest(env, chatBody) {
-  // Try primary route (Gateway or direct based on config)
   const primaryUrl = buildUpstreamUrl(env);
   const timeout = parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10);
   const primaryApiKey = chooseApiKey(env);
@@ -64,18 +63,14 @@ export async function sendChatRequest(env, chatBody) {
     timeout
   );
 
-  // If primary route succeeds or is not a 400 (client error), return as-is
+  // Primary route succeeded → return
   if (response.ok || response.status !== 400) return response;
 
-  // --- Fallback: Gateway 400 → retry directly to Console Go ---
-  // Gateway occasionally returns 400 with empty body (stored key issue).
-  // Direct Console Go always works, so fallback to it.
-  if (!isGatewayMode(env)) return response; // already in direct mode
+  // Gateway 400 → fallback directly to upstream (Console Go)
+  if (!isGatewayMode(env)) return response; // already direct, nothing to fallback
 
   const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
-  const fallbackApiKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
-
-  console.log(`Gateway 400 → fallback to direct: ${fallbackUrl}`);
+  const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 
   return fetchUpstream(
     fallbackUrl,
@@ -83,7 +78,7 @@ export async function sendChatRequest(env, chatBody) {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${fallbackApiKey}`,
+        Authorization: `Bearer ${fallbackKey}`,
       },
       body: JSON.stringify(chatBody),
     },

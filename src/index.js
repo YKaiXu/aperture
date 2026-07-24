@@ -11,7 +11,7 @@
 //   x-api-key: <token>             (Anthropic style)
 
 import { uid, now, errorResponse, corsHeaders, authenticate, withTimeout, createRateLimiter } from "./utils.js";
-import { sendChatRequest, getUpstreamUrl } from "./upstream.js";
+import { sendChatRequest } from "./upstream.js";
 import { translateToChat, translateStreamEvents, translateResponseJson } from "./responses.js";
 import { translateAnthropicToChat, translateAnthropicStream, translateAnthropicJson } from "./anthropic.js";
 
@@ -271,27 +271,33 @@ async function handleChatCompletions(body, env) {
 
   const upstreamResponse = await sendChatRequest(env, body);
   if (!upstreamResponse.ok) {
-    const upstreamUrl = getUpstreamUrl(env);
-    const upstreamBody = await safeReadUpstreamBody(upstreamResponse);
-    const errMsg = `Upstream returned ${upstreamResponse.status} - URL: ${upstreamUrl} - Body: ${upstreamBody}`;
-    return errorResponse(errMsg, "upstream_error", "UPSTREAM", upstreamResponse.status);
+    const errBody = await safeReadUpstreamBody(upstreamResponse);
+    return errorResponse(
+      `Upstream returned ${upstreamResponse.status} - ${errBody}`,
+      "upstream_error", "UPSTREAM", upstreamResponse.status
+    );
   }
 
-  // Stream passthrough (with reasoning_content filter for broader compatibility)
+  // Stream passthrough (filtering reasoning_content for Trae compat)
   if (body.stream) {
     return pipeChatStream(filterChatStream(upstreamResponse));
   }
 
-  // Non-streaming: normalize DSML tool calls and return
-  const responseBody = await upstreamResponse.json();
-  const normalizedBody = normalizeDsmlToolCalls(responseBody);
-  return new Response(JSON.stringify(normalizedBody), {
-    status: upstreamResponse.status,
-    headers: {
-      "Content-Type": "application/json",
-      ...corsHeaders(),
-    },
-  });
+  // Non-streaming: try DSML normalization, fallback to raw pass-through
+  try {
+    const responseBody = await upstreamResponse.json();
+    const normalizedBody = normalizeDsmlToolCalls(responseBody);
+    return new Response(JSON.stringify(normalizedBody), {
+      status: upstreamResponse.status,
+      headers: { "Content-Type": "application/json", ...corsHeaders() },
+    });
+  } catch {
+    // If JSON parsing fails, pass through raw response
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      headers: { "Content-Type": "application/json", ...corsHeaders() },
+    });
+  }
 }
 
 // ─── Responses API Handler ────────────────────────────
