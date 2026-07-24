@@ -10,78 +10,49 @@
 //   Authorization: Bearer <token>  (OpenAI style)
 //   x-api-key: <token>             (Anthropic style)
 
-import { uid, now, errorResponse, corsHeaders, authenticate, withTimeout, createRateLimiter } from "./utils.js";
+import { uid, now, errorResponse, corsHeaders, authenticate, resolveDefaultModel, createLogger, pipeEventStream, pipeChatStream } from "./utils.js";
 import { sendChatRequest } from "./upstream.js";
 import { translateToChat, translateStreamEvents, translateResponseJson } from "./responses.js";
 import { translateAnthropicToChat, translateAnthropicStream, translateAnthropicJson } from "./anthropic.js";
 
-// ── Rate limiter (per-worker instance, in-memory) ────
-const rateLimiter = createRateLimiter(60000, 120);
-
 /**
- * Map client-provided model names to actual upstream model names.
- * Supports:
- * 1. Known provider names (go, go_proxy, default, auto) → DEFAULT_MODEL
- * 2. Explicit model mappings via MODEL_MAP env var (JSON object)
- * 3. Everything else passes through (real model names like deepseek-v4-flash)
+ * Resolve the model to send to the upstream.
+ * Accepts any model ID from the client and passes it through unchanged.
+ * Client model mapping is handled by the AI Gateway.
+ * Only applies a fallback default if no model was provided.
  */
-function mapModelName(model, env = {}) {
-  if (!model) return env.DEFAULT_MODEL || "deepseek-v4-flash";
-
-  const trimmed = model.toLowerCase().trim();
-  const knownProviders = ["go", "go_proxy", "default", "auto"];
-  if (knownProviders.includes(trimmed)) {
-    return env.DEFAULT_MODEL || "deepseek-v4-flash";
-  }
-
-  // Parse custom model map from environment (case-insensitive keys)
-  if (env.MODEL_MAP) {
-    try {
-      const map = JSON.parse(env.MODEL_MAP);
-      if (map[trimmed]) return map[trimmed];
-    } catch {
-      // ignore invalid JSON
-    }
-  }
-
-  // Fallback to default model for any unrecognized name
-  // (so clients can use any arbitrary model alias)
-  return env.DEFAULT_MODEL || "deepseek-v4-flash";
+function resolveModel(model, env = {}) {
+  return resolveDefaultModel(env);
 }
 
 export default {
   async fetch(request, env) {
+    const requestId = uid("req");
+    const log = createLogger(requestId);
+
     // ── CORS preflight ─────────────────────────────────
     if (request.method === "OPTIONS") {
+      log.info("cors.preflight");
       return new Response(null, { headers: corsHeaders() });
     }
 
     if (request.method !== "POST") {
+      log.warn("method.not_allowed", { method: request.method });
       return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
     }
+
+    log.info("request.received", {
+      method: "POST",
+      path: new URL(request.url).pathname,
+    });
 
     // ── Authentication ─────────────────────────────────
     const auth = authenticate(request, env);
     if (!auth.ok) {
+      log.warn("auth.failed", { code: auth.code });
       return errorResponse(auth.error, "authentication_error", auth.code, auth.status);
     }
-
-    // ── Rate Limiting ──────────────────────────────────
-    const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
-    const rateCheck = rateLimiter.check(clientIp);
-    if (!rateCheck.allowed) {
-      return new Response(
-        JSON.stringify({ error: { message: "Rate limit exceeded. Try again later.", type: "rate_limit_error", code: "RATE_LIMITED" } }),
-        {
-          status: 429,
-          headers: {
-            "Content-Type": "application/json",
-            "Retry-After": String(Math.ceil((rateCheck.resetAt - Date.now()) / 1000)),
-            ...corsHeaders(),
-          },
-        }
-      );
-    }
+    log.info("auth.ok");
 
     // ── Parse body ─────────────────────────────────────
     let body;
@@ -89,18 +60,31 @@ export default {
       const raw = await request.text();
       body = JSON.parse(raw);
     } catch {
+      log.warn("body.parse_error");
       return errorResponse("Invalid JSON body", "invalid_request", "PARSE_ERROR", 400);
     }
 
+    // ── Extract auth header for forwarding to upstream ──
     // ── Route detection ────────────────────────────────
     const path = new URL(request.url).pathname;
     const route = detectRoute(path, body);
+    log.info("route.detected", { route, path });
 
-    switch (route) {
-      case "chat":     return handleChatCompletions(body, env);
-      case "responses": return handleResponsesAPI(body, env);
-      case "anthropic": return handleAnthropicMessages(body, env);
-      default:         return errorResponse("Unknown API format", "invalid_request", "FORMAT_UNKNOWN", 400);
+    try {
+      switch (route) {
+        case "chat":
+          return await handleChatCompletions(body, env, log);
+        case "responses":
+          return await handleResponsesAPI(body, env, log);
+        case "anthropic":
+          return await handleAnthropicMessages(body, env, log);
+        default:
+          log.warn("route.unknown");
+          return errorResponse("Unknown API format", "invalid_request", "FORMAT_UNKNOWN", 400);
+      }
+    } catch (err) {
+      log.error("handler.crash", { route, error: err.message });
+      return errorResponse("Internal error", "server_error", "INTERNAL", 500);
     }
   },
 };
@@ -113,7 +97,7 @@ function detectRoute(path, body) {
   if (path === "/v1/messages" || path.endsWith("/messages")) return "anthropic";
 
   // Auto-detect by body shape
-  if (body.messages) return "chat"; // Chat Completions is default for raw messages
+  if (body.messages) return "chat";
   if (body.input !== undefined || body.instructions !== undefined) return "responses";
   if (body.anthropic_version || body.anthropic) return "anthropic";
 
@@ -124,80 +108,13 @@ function detectRoute(path, body) {
 // ─── Chat Completions Passthrough ──────────────────────
 
 /**
- * Pipe an async generator of event objects to a SSE Response.
- * Each event object should have { event, data } properties.
- * Shared across Chat/Responses/Anthropic streaming handlers.
- */
-function pipeEventStream(stream, extraHeaders = {}) {
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const encoder = new TextEncoder();
-
-  (async () => {
-    try {
-      for await (const { event, data } of stream) {
-        const raw = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-        await writer.write(encoder.encode(raw));
-      }
-    } catch (err) {
-      try {
-        await writer.write(
-          encoder.encode(`event: error\ndata: {"type":"error","error":{"message":"Internal error"}}\n\n`)
-        );
-      } catch { /* ignore */ }
-    } finally {
-      try { await writer.close(); } catch { /* ignore */ }
-    }
-  })();
-
-  return new Response(readable, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      ...extraHeaders,
-      ...corsHeaders(),
-    },
-  });
-}
-
-/**
- * Pipe filtered SSE lines to a Response for Chat Completions streaming.
- */
-function pipeChatStream(stream) {
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const encoder = new TextEncoder();
-
-  (async () => {
-    try {
-      for await (const line of stream) {
-        await writer.write(encoder.encode(line + "\n"));
-      }
-    } catch { /* ignore write errors if client disconnected */ }
-    finally {
-      try { await writer.close(); } catch { /* ignore */ }
-    }
-  })();
-
-  return new Response(readable, {
-    headers: {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
-      ...corsHeaders(),
-    },
-  });
-}
-
-/**
  * Filter streaming SSE chunks to strip non-standard fields that some clients
  * (e.g. Trae IDE) cannot handle.
  *
  * DeepSeek models emit `reasoning_content` in streaming delta chunks.
  * Standard OpenAI Chat Completions clients may choke on this field.
- * This filter removes `reasoning_content` and skips chunks that only
- * contain reasoning (no actual content delta).
+ * This filter removes `reasoning_content`, normalizes `content: null` to `""`,
+ * and skips chunks that only contain reasoning (no actual content delta).
  */
 async function* filterChatStream(upstreamResponse) {
   const reader = upstreamResponse.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -236,14 +153,17 @@ async function* filterChatStream(upstreamResponse) {
       let modified = false;
       for (const choice of parsed.choices) {
         if (!choice.delta) continue;
-        // Strip reasoning_content (DeepSeek non-standard field)
-        if (choice.delta.reasoning_content !== undefined) {
-          delete choice.delta.reasoning_content;
-          modified = true;
-        }
+
         // Convert content: null → "" (some clients expect string content)
         if (choice.delta.content === null) {
           choice.delta.content = "";
+          modified = true;
+        }
+
+        // Strip reasoning_content (DeepSeek non-standard field).
+        // Must check AFTER the null→"" conversion above.
+        if (choice.delta.reasoning_content !== undefined) {
+          delete choice.delta.reasoning_content;
           modified = true;
         }
       }
@@ -251,9 +171,7 @@ async function* filterChatStream(upstreamResponse) {
         yield line; // nothing changed — pass through
         continue;
       }
-      // Keep the chunk if:
-      // 1. Any choice has non-empty delta content (including role), OR
-      // 2. Any choice has a finish_reason (stream end signal)
+      // Keep the chunk if any choice has a meaningful delta or finish_reason.
       const hasContent = parsed.choices.some(c =>
         (c.delta && Object.keys(c.delta).length > 0) || c.finish_reason
       );
@@ -265,13 +183,15 @@ async function* filterChatStream(upstreamResponse) {
   }
 }
 
-async function handleChatCompletions(body, env) {
+async function handleChatCompletions(body, env, log) {
   // Override model and passthrough
-  body.model = mapModelName(body.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+  body.model = resolveModel(body.model, env);
+  log.info("chat.mapped_model", { model: body.model });
 
-  const upstreamResponse = await sendChatRequest(env, body);
+  const upstreamResponse = await sendChatRequest(env, body, log);
   if (!upstreamResponse.ok) {
-    const errBody = await safeReadUpstreamBody(upstreamResponse);
+    const errBody = await readUpstreamErrorBody(upstreamResponse);
+    log.warn("upstream.error", { status: upstreamResponse.status, detail: errBody });
     return errorResponse(
       `Upstream returned ${upstreamResponse.status} - ${errBody}`,
       "upstream_error", "UPSTREAM", upstreamResponse.status
@@ -280,6 +200,7 @@ async function handleChatCompletions(body, env) {
 
   // Stream passthrough (filtering reasoning_content for Trae compat)
   if (body.stream) {
+    log.info("chat.streaming");
     return pipeChatStream(filterChatStream(upstreamResponse));
   }
 
@@ -287,12 +208,14 @@ async function handleChatCompletions(body, env) {
   try {
     const responseBody = await upstreamResponse.json();
     const normalizedBody = normalizeDsmlToolCalls(responseBody);
+    log.info("chat.completed", { dsml: normalizedBody !== responseBody });
     return new Response(JSON.stringify(normalizedBody), {
       status: upstreamResponse.status,
       headers: { "Content-Type": "application/json", ...corsHeaders() },
     });
   } catch {
     // If JSON parsing fails, pass through raw response
+    log.info("chat.raw_passthrough");
     return new Response(upstreamResponse.body, {
       status: upstreamResponse.status,
       headers: { "Content-Type": "application/json", ...corsHeaders() },
@@ -302,18 +225,18 @@ async function handleChatCompletions(body, env) {
 
 // ─── Responses API Handler ────────────────────────────
 
-async function handleResponsesAPI(body, env) {
+async function handleResponsesAPI(body, env, log) {
   const respId = uid("resp");
 
   // Translate to Chat Completions format
   const chatReq = translateToChat(body);
-  // Map Codex provider names to actual model names
-  chatReq.model = mapModelName(chatReq.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+  chatReq.model = resolveModel(chatReq.model, env);
+  log.info("responses.translated", { respId, model: chatReq.model, stream: !!chatReq.stream });
 
-  // Send upstream
-  const upstreamResponse = await sendChatRequest(env, chatReq);
+  const upstreamResponse = await sendChatRequest(env, chatReq, log);
   if (!upstreamResponse.ok) {
-    const errMsg = await readUpstreamErrorSafe(upstreamResponse);
+    const errMsg = await readUpstreamErrorBody(upstreamResponse);
+    log.warn("responses.upstream_error", { status: upstreamResponse.status, detail: errMsg });
     return new Response(
       JSON.stringify({
         id: respId,
@@ -330,13 +253,13 @@ async function handleResponsesAPI(body, env) {
     );
   }
 
-  // Streaming
   if (chatReq.stream) {
+    log.info("responses.streaming", { respId });
     return pipeEventStream(translateStreamEvents(upstreamResponse, respId));
   }
 
-  // Non-streaming
   const result = await translateResponseJson(upstreamResponse, respId);
+  log.info("responses.completed", { respId });
   return new Response(JSON.stringify(result), {
     headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
@@ -344,27 +267,18 @@ async function handleResponsesAPI(body, env) {
 
 // ─── Anthropic Messages API Handler ───────────────────
 
-function anthropicHeaders(extra = {}) {
-  return {
-    "Content-Type": "application/json",
-    "x-request-id": uid("req"),
-    "request-id": uid("req"),
-    ...extra,
-    ...corsHeaders(),
-  };
-}
-
-async function handleAnthropicMessages(body, env) {
+async function handleAnthropicMessages(body, env, log) {
   const requestId = uid("msg");
 
   // Translate Anthropic request → Chat Completions
   const chatReq = translateAnthropicToChat(body);
-  chatReq.model = mapModelName(chatReq.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+  chatReq.model = resolveModel(chatReq.model, env);
+  log.info("anthropic.translated", { requestId, model: chatReq.model, stream: !!chatReq.stream });
 
-  // Send upstream
-  const upstreamResponse = await sendChatRequest(env, chatReq);
+  const upstreamResponse = await sendChatRequest(env, chatReq, log);
   if (!upstreamResponse.ok) {
-    const errMsg = await readUpstreamErrorSafe(upstreamResponse);
+    const errMsg = await readUpstreamErrorBody(upstreamResponse);
+    log.warn("anthropic.upstream_error", { status: upstreamResponse.status, detail: errMsg });
     return new Response(
       JSON.stringify({
         id: requestId,
@@ -378,16 +292,16 @@ async function handleAnthropicMessages(body, env) {
     );
   }
 
-  // Streaming
   if (chatReq.stream) {
+    log.info("anthropic.streaming", { requestId });
     return pipeEventStream(translateAnthropicStream(upstreamResponse, requestId), {
       "x-request-id": requestId,
       "request-id": requestId,
     });
   }
 
-  // Non-streaming
   const result = await translateAnthropicJson(upstreamResponse, requestId);
+  log.info("anthropic.completed", { requestId });
   return new Response(JSON.stringify(result), {
     headers: {
       "Content-Type": "application/json",
@@ -400,12 +314,18 @@ async function handleAnthropicMessages(body, env) {
 
 // ─── Internal Helpers ─────────────────────────────────
 
+function anthropicHeaders(extra = {}) {
+  return {
+    "Content-Type": "application/json",
+    "x-request-id": uid("req"),
+    "request-id": uid("req"),
+    ...extra,
+    ...corsHeaders(),
+  };
+}
+
 /**
  * Detect and convert Console Go DSML tool calls to standard OpenAI tool_calls format.
- * 
- * Console Go sometimes returns tool calls as DSML XML embedded in the content text
- * (with finish_reason: "stop") instead of standard message.tool_calls format.
- * This function detects this pattern and normalizes it.
  */
 function normalizeDsmlToolCalls(responseBody) {
   if (!responseBody?.choices?.[0]?.message) return responseBody;
@@ -413,62 +333,38 @@ function normalizeDsmlToolCalls(responseBody) {
   const msg = choice.message;
   const content = msg.content || "";
 
-  // Check if content contains DSML tool call pattern
-  // DSML format: <...DSML...tool_calls> (tool_calls inside the tag)
-  // Use multiple detection methods for robustness
   const dsmlDetect = (
-    content.includes("DSML") && 
+    content.includes("DSML") &&
     (content.includes("tool_calls") || content.includes("invoke name"))
   );
   if (!dsmlDetect) return responseBody;
 
-  // Extract tool calls from DSML - try multiple regex patterns
   const toolCalls = [];
-  
-  // Pattern 1: <...DSML...> invoke name="funcName"
-  let invokeRe = /DSML[^>]*>\s*invoke\s+name\s*=\s*"([^"]+)"/gi;
-  let invokeMatches = [...content.matchAll(invokeRe)];
-  
-  // Pattern 2: Fallback: simple "invoke name=" extraction  
-  if (invokeMatches.length === 0) {
-    const simpleRe = /invoke\s+name\s*=\s*"([^"]+)"/gi;
-    invokeMatches = [...content.matchAll(simpleRe)];
-  }
-  
-  // Pattern 1 for parameters
-  let paramRe = /DSML[^>]*>\s*parameter\s+name\s*=\s*"([^"]+)"[^>]*>([^<]*)<\//gi;
-  let paramMatches = [...content.matchAll(paramRe)];
-  
-  // Fallback: simple parameter extraction
-  if (paramMatches.length === 0) {
-    const simpleParamRe = /parameter\s+name\s*=\s*"([^"]+)"[^>]*>([^<]*)<\//gi;
-    paramMatches = [...content.matchAll(simpleParamRe)];
-  }
 
-  let callIndex = 0;
-  for (const invokeMatch of invokeMatches) {
+  const sections = content.split(/(?=invoke\s+name\s*=)/gi);
+  for (const section of sections) {
+    const invokeMatch = section.match(/invoke\s+name\s*=\s*"([^"]+)"/i);
+    if (!invokeMatch) continue;
+
     const fnName = invokeMatch[1];
     const args = {};
-    for (const p of paramMatches) {
-      if (p[1]) args[p[1]] = p[2] || "";
+    const paramRe = /parameter\s+name\s*=\s*"([^"]+)"[^>]*>([^<]*)<\//gi;
+    let pMatch;
+    while ((pMatch = paramRe.exec(section)) !== null) {
+      if (pMatch[1]) args[pMatch[1]] = pMatch[2] || "";
     }
 
     toolCalls.push({
-      index: callIndex,
+      index: toolCalls.length,
       id: `call_dsml_${uid("")}`,
       type: "function",
-      function: {
-        name: fnName,
-        arguments: JSON.stringify(args),
-      },
+      function: { name: fnName, arguments: JSON.stringify(args) },
     });
-    callIndex++;
   }
 
   if (toolCalls.length === 0) return responseBody;
 
-  // Build cleaned response
-  msg.content = ""; // DSML content replaced with empty string
+  msg.content = "";
   msg.tool_calls = toolCalls;
   if (choice.finish_reason === "stop" || choice.finish_reason === "length") {
     choice.finish_reason = "tool_calls";
@@ -477,22 +373,19 @@ function normalizeDsmlToolCalls(responseBody) {
   return responseBody;
 }
 
-async function readUpstreamErrorSafe(response) {
-  try {
-    const body = await response.json();
-    return body.error?.message || body.message || `Upstream returned ${response.status}`;
-  } catch {
-    return `Upstream returned ${response.status}`;
-  }
-}
-
 /**
- * Safely read upstream error response body for diagnostic purposes.
+ * Safely extract error message from an upstream error response.
  */
-async function safeReadUpstreamBody(response) {
+async function readUpstreamErrorBody(response) {
   try {
     const text = await response.text();
-    return (text || "(empty)").slice(0, 500);
+    if (!text) return "(empty body)";
+    try {
+      const json = JSON.parse(text);
+      return json.error?.message || json.message || text.slice(0, 500);
+    } catch {
+      return text.slice(0, 500) || "(empty)";
+    }
   } catch {
     return "(unreadable)";
   }

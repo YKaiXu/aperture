@@ -1,7 +1,7 @@
 // ─── Anthropic Messages API → OpenCode Chat Completions ───
 
-import { uid, now, extractText } from "./utils.js";
-import { sendChatRequest, extractUsage, getFinishReason } from "./upstream.js";
+import { uid, now, extractText, resolveDefaultModel, parseChatSSE, MIN_MAX_TOKENS } from "./utils.js";
+import { extractUsage } from "./upstream.js";
 
 /**
  * Translate an Anthropic Messages API request body to OpenCode Chat Completions format.
@@ -81,7 +81,33 @@ export function translateAnthropicToChat(body) {
 
     if (msg.role === "assistant") {
       const translated = translateAnthropicContent(msg.content);
-      messages.push({ role: "assistant", content: translated.text });
+      const assistantMsg = { role: "assistant", content: translated.text };
+
+      // Convert tool_use blocks in assistant messages to tool_calls
+      // so the upstream Chat Completions API sees a complete tool call cycle.
+      if (Array.isArray(msg.content)) {
+        const toolCalls = [];
+        for (const block of msg.content) {
+          if (block.type === "tool_use") {
+            toolCalls.push({
+              id: block.id || `call_${uid("")}`,
+              type: "function",
+              function: {
+                name: block.name,
+                arguments:
+                  typeof block.input === "string"
+                    ? block.input
+                    : JSON.stringify(block.input || {}),
+              },
+            });
+          }
+        }
+        if (toolCalls.length > 0) {
+          assistantMsg.tool_calls = toolCalls;
+        }
+      }
+
+      messages.push(assistantMsg);
       continue;
     }
 
@@ -122,7 +148,7 @@ export function translateAnthropicToChat(body) {
   if (body.max_tokens === undefined) chat.max_tokens = 8192;
   // Enforce a sensible minimum so reasoning models don't spend the whole budget
   // on chain-of-thought and leave the actual answer empty.
-  chat.max_tokens = Math.max(chat.max_tokens, 1024);
+  chat.max_tokens = Math.max(chat.max_tokens, MIN_MAX_TOKENS);
 
   // Tools → function calling
   if (body.tools && body.tools.length > 0) {
@@ -130,13 +156,16 @@ export function translateAnthropicToChat(body) {
     for (const t of body.tools) {
       if (t.type === "custom" || t.type === "function" || (!t.type && t.name)) {
         const fn = t.function || t;
+        // OpenAI Chat Completions uses `parameters`; Anthropic uses `input_schema`.
+        // Map Anthropic's `input_schema` to `parameters` and omit `input_schema`.
+        const schema = fn.parameters || t.parameters || fn.input_schema || t.input_schema;
+        if (!schema) continue;
         tools.push({
           type: "function",
           function: {
             name: fn.name || t.name,
             description: fn.description || t.description,
-            input_schema: fn.input_schema || t.input_schema,
-            parameters: fn.parameters || t.parameters || fn.input_schema || t.input_schema,
+            parameters: schema,
           },
         });
       }
@@ -169,6 +198,8 @@ export function translateAnthropicToChat(body) {
  * that an Anthropic client can consume.
  */
 export async function* translateAnthropicStream(upstreamResponse, requestId) {
+  const model = resolveDefaultModel();
+
   // Emit the start-of-stream event for Anthropic
   yield {
     event: "message_start",
@@ -179,7 +210,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
         type: "message",
         role: "assistant",
         content: [],
-        model: "deepseek-v4-flash",
+        model,
         stop_reason: null,
         stop_sequence: null,
         usage: { input_tokens: 0, output_tokens: 0 },
@@ -194,7 +225,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
   let lastFinishReason = null;
   const streamUsage = { input_tokens: 0, output_tokens: 0 };
 
-  for await (const chunk of streamFromResponse(upstreamResponse)) {
+  for await (const chunk of parseChatSSE(upstreamResponse)) {
     // Track usage from chunks (some providers emit usage in the final chunk)
     if (chunk.usage) {
       streamUsage.input_tokens = chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0;
@@ -433,7 +464,7 @@ export async function translateAnthropicJson(upstreamResponse, requestId) {
     type: "message",
     role: "assistant",
     content,
-    model: "deepseek-v4-flash",
+    model: resolveDefaultModel(),
     stop_reason: stopReason,
     stop_sequence: null,
     usage: data.usage
@@ -448,16 +479,7 @@ export async function translateAnthropicJson(upstreamResponse, requestId) {
 // ─── Internal helpers ──────────────────────────────
 
 function translateModel(model) {
-  if (!model) return "deepseek-v4-flash";
-  // Map common Anthropic model names to our model
-  const modelMap = {
-    "claude-sonnet-4-20250514": "deepseek-v4-flash",
-    "claude-sonnet-4": "deepseek-v4-flash",
-    "claude-3-5-sonnet-latest": "deepseek-v4-flash",
-    "claude-3-haiku": "deepseek-v4-flash",
-    "claude-3-opus": "deepseek-v4-flash",
-  };
-  return modelMap[model] || "deepseek-v4-flash";
+  return resolveDefaultModel();
 }
 
 function mapFinishReason(fr) {
@@ -497,10 +519,9 @@ function translateAnthropicContent(content) {
           });
         }
       } else if (block.type === "tool_result") {
-        // Already handled at message level
         text += extractText(block.content) || "";
       } else if (block.type === "tool_use") {
-        // Already handled at message level
+        // Handled at message level — converted to tool_calls on assistant message
       } else if (block.type === "thinking") {
         text += `[Thinking: ${block.thinking || ""}]`;
       } else if (block.type === "redacted_thinking") {
@@ -512,27 +533,4 @@ function translateAnthropicContent(content) {
   return { text: "", images: [] };
 }
 
-async function* streamFromResponse(response) {
-  // Guard against empty response body (e.g., AI Gateway returning 200 with no body)
-  if (!response.body) return;
-  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += value;
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data: ")) continue;
-      const payload = trimmed.slice(6).trim();
-      if (payload === "[DONE]") continue;
-      try {
-        yield JSON.parse(payload);
-      } catch {
-        // skip
-      }
-    }
-  }
-}
+

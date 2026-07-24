@@ -1,4 +1,8 @@
 // ─── Utilities ───────────────────────────────────────────
+// Shared defaults
+export const DEFAULT_MODEL = "deepseek-v4-flash";
+export const MIN_MAX_TOKENS = 1024;
+export const DEFAULT_MAX_TOKENS = 16384;
 
 /**
  * Generate a unique ID with a given prefix.
@@ -15,6 +19,13 @@ export function uid(prefix = "resp") {
  */
 export function now() {
   return Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Resolve the effective default model from env or built-in fallback.
+ */
+export function resolveDefaultModel(env) {
+  return env?.DEFAULT_MODEL || DEFAULT_MODEL;
 }
 
 /**
@@ -49,7 +60,7 @@ export function errorResponse(message, type, code, status = 400) {
     }),
     {
       status,
-      headers: { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" },
+      headers: { "Content-Type": "application/json", ...corsHeaders() },
     }
   );
 }
@@ -91,57 +102,54 @@ export function authenticate(request, env) {
   return { ok: true };
 }
 
-/**
- * Get the upstream API key from environment, with fallback.
- */
-export function getUpstreamApiKey(env) {
-  return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
-}
+
+
+// ─── Structured Logger ────────────────────────────────
 
 /**
- * Create an AbortController with timeout.
+ * Create a structured JSON logger for Cloudflare Workers observability.
+ * Every log entry is a single line of JSON, ingestible by Cloudflare's
+ * logging pipeline, Grafana, or any log aggregation system.
+ *
+ * Usage:
+ *   const log = createLogger("req_abc123");
+ *   log.info("route.detected", { route: "chat", path: "/v1/chat/completions" });
+ *   log.error("upstream.failed", { status: 502 });
+ *
+ * @param {string} requestId - Unique request identifier for correlation.
+ * @returns {{ info: Function, warn: Function, error: Function }}
  */
-export function withTimeout(ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return { controller, timer, signal: controller.signal };
-}
-
-/**
- * Fetch upstream with timeout and error handling.
- */
-export async function fetchUpstream(url, options, timeoutMs = 60000) {
-  const { controller, timer, signal } = withTimeout(timeoutMs);
-  try {
-    const response = await fetch(url, { ...options, signal });
-    return response;
-  } catch (err) {
-    if (err.name === "AbortError") {
-      throw new Error("Upstream request timed out");
+export function createLogger(requestId = "unknown") {
+  function emit(level, event, data = {}) {
+    const entry = JSON.stringify({
+      level,
+      event,
+      requestId,
+      timestamp: Date.now(),
+      ...data,
+    });
+    if (level === "error") {
+      console.error(entry);
+    } else {
+      console.log(entry);
     }
-    throw err;
-  } finally {
-    clearTimeout(timer);
   }
+
+  return {
+    info: (event, data) => emit("info", event, data),
+    warn: (event, data) => emit("warn", event, data),
+    error: (event, data) => emit("error", event, data),
+  };
 }
 
-/**
- * Read upstream error body.
- */
-export async function readUpstreamError(response) {
-  try {
-    const body = await response.json();
-    return body.error?.message || body.message || `Upstream returned ${response.status}`;
-  } catch {
-    return `Upstream returned ${response.status}`;
-  }
-}
+// ─── SSE Stream Utilities (shared across handlers) ────
 
 /**
- * Convert a ReadableStream to an async iterable of SSE events.
+ * Parse a ReadableStream into an async generator of parsed JSON chunks
+ * (Chat Completions SSE format — "data: {...}").
  */
-export async function* streamSSE(response) {
-  if (!response.body) return;
+export async function* parseChatSSE(response) {
+  if (!response?.body) return;
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   while (true) {
@@ -152,45 +160,59 @@ export async function* streamSSE(response) {
     buffer = lines.pop() || "";
     for (const line of lines) {
       const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(":")) continue;
-      if (trimmed.startsWith("data: ")) {
-        const payload = trimmed.slice(6).trim();
-        if (payload === "[DONE]") continue;
-        try {
-          yield JSON.parse(payload);
-        } catch {
-          // skip malformed JSON
-        }
-      }
+      if (!trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        yield JSON.parse(payload);
+      } catch { /* skip malformed chunks */ }
     }
   }
 }
 
-// ─── Rate Limiting (in-memory) ──────────────────────
-
 /**
- * Simple in-memory rate limiter using a sliding window.
- * No global timers (safe for Workers global scope).
- * Cleans up expired entries lazily during check().
+ * Create a pipe function that writes items from an async generator to a SSE Response.
+ *
+ * @param {(item: any) => string} serialize - Converts a generator item to a text line (without trailing newline).
+ * @returns {(stream: AsyncGenerator, extraHeaders?: object) => Response}
  */
-export function createRateLimiter(windowMs = 60000, maxRequests = 60) {
-  const hits = new Map();
+function createPipeStream(serialize) {
+  return (stream, extraHeaders = {}) => {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
 
-  return {
-    check(key) {
-      const now = Date.now();
-      let record = hits.get(key);
-      if (!record) {
-        record = { timestamps: [] };
-        hits.set(key, record);
+    (async () => {
+      try {
+        for await (const item of stream) {
+          await writer.write(encoder.encode(serialize(item) + "\n"));
+        }
+      } catch { /* ignore write errors if client disconnected */ }
+      finally {
+        try { await writer.close(); } catch { /* ignore */ }
       }
-      // Remove expired timestamps (lazy cleanup)
-      record.timestamps = record.timestamps.filter((t) => now - t < windowMs);
-      if (record.timestamps.length >= maxRequests) {
-        return { allowed: false, remaining: 0, resetAt: record.timestamps[0] + windowMs };
-      }
-      record.timestamps.push(now);
-      return { allowed: true, remaining: maxRequests - record.timestamps.length, resetAt: now + windowMs };
-    },
+    })();
+
+    return new Response(readable, {
+      headers: {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+        ...extraHeaders,
+        ...corsHeaders(),
+      },
+    });
   };
 }
+
+/** Pipe an async generator of { event, data } objects as SSE events. */
+export const pipeEventStream = createPipeStream(
+  ({ event, data }) => `event: ${event}\ndata: ${JSON.stringify(data)}`
+);
+
+/** Pipe an async generator of raw text lines. */
+export const pipeChatStream = createPipeStream(
+  (line) => line
+);
+
+

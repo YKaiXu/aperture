@@ -1,7 +1,7 @@
 // ─── OpenAI Responses API → OpenCode Chat Completions ─────
 
-import { uid, now, extractText } from "./utils.js";
-import { sendChatRequest, extractUsage } from "./upstream.js";
+import { uid, now, extractText, resolveDefaultModel, parseChatSSE, MIN_MAX_TOKENS, DEFAULT_MAX_TOKENS } from "./utils.js";
+import { extractUsage } from "./upstream.js";
 
 /**
  * Translate an OpenAI Responses API request body to OpenCode Chat Completions format.
@@ -112,9 +112,9 @@ export function translateToChat(body) {
 
   // Build the chat request
   const chat = {
-    model: body.model || "deepseek-v4-flash",
+    model: body.model || resolveDefaultModel(),
     messages,
-    stream: body.stream !== false,
+    stream: body.stream === true,
   };
 
   // Copy over supported parameters
@@ -124,10 +124,10 @@ export function translateToChat(body) {
   }
 
   // Token limits
-  const maxTokens = body.max_output_tokens ?? body.max_tokens ?? 16384;
+  const maxTokens = body.max_output_tokens ?? body.max_tokens ?? DEFAULT_MAX_TOKENS;
   // Enforce a sensible minimum so reasoning models don't spend the whole budget
   // on chain-of-thought and leave the actual answer empty.
-  chat.max_tokens = Math.max(maxTokens, 1024);
+  chat.max_tokens = Math.max(maxTokens, MIN_MAX_TOKENS);
 
   // Tool/function definitions
   if (body.tools && body.tools.length > 0) {
@@ -184,13 +184,13 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
         id: respId,
         object: "response",
         created_at: now(),
-        model: "deepseek-v4-flash",
+        model: resolveDefaultModel(),
         output: [],
       },
     },
   };
 
-  for await (const chunk of streamFromUpstream(upstreamResponse)) {
+  for await (const chunk of parseChatSSE(upstreamResponse)) {
     if (chunk.usage) usage = chunk.usage;
 
     for (const choice of chunk.choices || []) {
@@ -306,7 +306,8 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
           yield { event: "response.output_item.done", data: makeToolCallDone(outputIndex, tc) };
           outputIndex++;
         }
-        toolCallsMap.length = 0;
+        // Properly clear the object (toolCallsMap is an Object, not an Array)
+        Object.keys(toolCallsMap).forEach((k) => delete toolCallsMap[k]);
         toolOrder.length = 0;
       }
     }
@@ -335,7 +336,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
         id: respId,
         object: "response",
         created_at: now(),
-        model: "deepseek-v4-flash",
+        model: resolveDefaultModel(),
         output: [],
         usage: respUsage,
       },
@@ -385,7 +386,7 @@ export async function translateResponseJson(upstreamResponse, respId) {
     id: respId,
     object: "response",
     created_at: now(),
-    model: "deepseek-v4-flash",
+    model: resolveDefaultModel(),
     output,
     usage: data.usage
       ? {
@@ -398,31 +399,6 @@ export async function translateResponseJson(upstreamResponse, respId) {
 }
 
 // ─── Internal helpers ──────────────────────────────
-
-async function* streamFromUpstream(response) {
-  // Guard against empty response body
-  if (!response.body) return;
-  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += value;
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data: ")) continue;
-      const payload = trimmed.slice(6).trim();
-      if (payload === "[DONE]") continue;
-      try {
-        yield JSON.parse(payload);
-      } catch {
-        // skip malformed chunks
-      }
-    }
-  }
-}
 
 function makeTextDone(idx, text) {
   return { type: "response.output_text.done", output_index: idx, content_index: 0, text };

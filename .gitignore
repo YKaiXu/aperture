@@ -5,3 +5,7 @@ node_modules/
 .DS_Store
 *.log
 wrangler.toml
+.wrangler/
+tests/vitest-out.txt
+tests/test-request*.json
+aperture-code-review-report.md
