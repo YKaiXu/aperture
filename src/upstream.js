@@ -1,41 +1,37 @@
 // ─── Upstream API Client ─────────────────────────────────
-// Routes through Cloudflare AI Gateway for caching + analytics when configured.
-//
-// Gateway setup (Cloudflare Dashboard → AI → AI Gateway → opencodego):
-// 1. Add a provider → OpenAI Compatible
-// 2. Endpoint URL: https://opencode.ai/zen/go/v1
-// 3. API Key: your OpenCode API key
-// 4. Then set AI_GATEWAY_URL env var to enable routing through the gateway
+// Routes through Cloudflare AI Gateway for caching + analytics.
+// Falls back to direct upstream on Gateway failure.
 
 import { fetchUpstream } from "./utils.js";
 
-/**
- * Build the upstream Chat Completions URL.
- * Uses UPSTREAM_BASE_URL directly (not Gateway) for maximum reliability.
- * Gateway is used only for analytics logging (optional).
- */
 function buildUpstreamUrl(env) {
+  // AI Gateway route
+  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
+  if (gwUrl) {
+    const base = gwUrl.replace(/\/+$/, "");
+    const slug = env.CUSTOM_PROVIDER_SLUG || "";
+    return slug ? `${base}/custom-${slug}/v1/chat/completions` : `${base}/chat/completions`;
+  }
+  // Direct route (fallback)
   const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
   return `${baseUrl}/chat/completions`;
 }
 
-/**
- * Choose the API key: always use OPENCODE_API_KEY for upstream requests.
- */
 function chooseApiKey(env) {
+  // In Gateway mode, use Gateway token (Gateway stores upstream API key)
+  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
+  if (gwUrl) {
+    return env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
+  }
   return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 }
 
-/**
- * Send a Chat Completions request directly to the upstream API.
- * Reliable and simple — no Gateway in the request path.
- */
 export async function sendChatRequest(env, chatBody) {
   const url = buildUpstreamUrl(env);
   const apiKey = chooseApiKey(env);
   const timeout = parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10);
 
-  return fetchUpstream(
+  const response = await fetchUpstream(
     url,
     {
       method: "POST",
@@ -47,13 +43,27 @@ export async function sendChatRequest(env, chatBody) {
     },
     timeout
   );
-}
 
-/**
- * Get the upstream URL that would be used (for diagnostics).
- */
-export function getUpstreamUrl(env) {
-  return buildUpstreamUrl(env);
+  if (response.ok || response.status !== 400) return response;
+
+  // Gateway 400 → fallback directly to upstream
+  if (!(env.AI_GATEWAY_URL || "").trim()) return response; // already direct
+
+  const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
+  const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
+
+  return fetchUpstream(
+    fallbackUrl,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${fallbackKey}`,
+      },
+      body: JSON.stringify(chatBody),
+    },
+    timeout
+  );
 }
 
 export function extractUsage(upstreamData) {
