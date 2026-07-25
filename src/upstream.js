@@ -2,7 +2,7 @@
 // Routes through Cloudflare AI Gateway for caching + analytics.
 // Falls back to direct upstream on Gateway failure.
 
-import { fetchUpstream } from "./utils.js";
+import { fetchUpstream } from "./helpers.js";
 
 function buildUpstreamUrl(env) {
   // Direct mode: skip AI Gateway entirely
@@ -38,61 +38,93 @@ function chooseApiKey(env) {
   return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 }
 
-export async function sendChatRequest(env, chatBody) {
+function mergeSignals(clientSignal, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  const onAbort = () => controller.abort();
+  if (clientSignal) {
+    clientSignal.addEventListener("abort", onAbort);
+  }
+
+  return {
+    signal: controller.signal,
+    cleanup() {
+      clearTimeout(timeoutId);
+      if (clientSignal) {
+        clientSignal.removeEventListener("abort", onAbort);
+      }
+    },
+  };
+}
+
+export async function sendChatRequest(env, chatBody, clientSignal) {
   const url = buildUpstreamUrl(env);
   const apiKey = chooseApiKey(env);
-  const timeout = Math.max(1000, parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10) || 120000);
+  const timeoutMs = Math.max(1000, parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10) || 120000);
 
-  const response = await fetchUpstream(
-    url,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify(chatBody),
-    },
-    timeout
-  );
+  const { signal, cleanup } = mergeSignals(clientSignal, timeoutMs);
 
-  // Pass through successful responses
-  if (response.ok) return response;
-
-  // Gateway error (5xx) -> fallback directly to upstream
-  const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
-  const usingGateway = !bypass && (env.AI_GATEWAY_URL || "").trim();
-
-  if (response.status >= 500 && usingGateway) {
-    const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
-    const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
-
-    return fetchUpstream(
-      fallbackUrl,
+  try {
+    const response = await fetchUpstream(
+      url,
       {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${fallbackKey}`,
+          Authorization: `Bearer ${apiKey}`,
         },
         body: JSON.stringify(chatBody),
+        signal,
       },
-      timeout
+      timeoutMs,
     );
-  }
 
-  // Non-retryable error — return as-is to the caller
-  return response;
+    // Pass through successful responses
+    if (response.ok) return response;
+
+    // Gateway error (5xx) -> fallback directly to upstream
+    const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
+    const usingGateway = !bypass && (env.AI_GATEWAY_URL || "").trim();
+
+    if (response.status >= 500 && usingGateway) {
+      const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
+      const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
+
+      return fetchUpstream(
+        fallbackUrl,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${fallbackKey}`,
+          },
+          body: JSON.stringify(chatBody),
+        },
+        timeoutMs,
+      );
+    }
+
+    // Non-retryable error — return as-is to the caller
+    return response;
+  } catch (err) {
+    return new Response(
+      JSON.stringify({
+        error: { message: "Upstream network error", type: "network_error", code: "NETWORK_ERROR" },
+      }),
+      { status: 502, headers: { "Content-Type": "application/json" } },
+    );
+  } finally {
+    cleanup();
+  }
 }
 
-export function extractUsage(upstreamData) {
-  if (!upstreamData?.usage) return null;
-  const u = upstreamData.usage;
+export function extractUsage(data) {
+  if (!data?.usage) return null;
+  const u = data.usage;
   return {
     input_tokens: u.prompt_tokens ?? u.input_tokens ?? 0,
     output_tokens: u.completion_tokens ?? u.output_tokens ?? 0,
     total_tokens: u.total_tokens ?? 0,
   };
 }
-
-

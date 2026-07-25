@@ -1,6 +1,8 @@
 // --- Anthropic Messages API -> OpenCode Chat Completions ---
 
-import { uid, now, extractText, streamSSE, resolveDefaultModel } from "./utils.js";
+import { uid, now, extractText } from "../helpers.js";
+import { streamSSE } from "../stream.js";
+import { resolveDefaultModel } from "../config.js";
 
 /**
  * Translate an Anthropic Messages API request body to OpenCode Chat Completions format.
@@ -21,9 +23,9 @@ export function translateAnthropicToChat(body, env) {
 
   // Extract system prompt (Anthropic puts it at top level)
   if (body.system) {
-    systemContent = typeof body.system === "string" 
-      ? body.system 
-      : Array.isArray(body.system) 
+    systemContent = typeof body.system === "string"
+      ? body.system
+      : Array.isArray(body.system)
         ? body.system.map((b) => extractText(b)).join("\n")
         : "";
   }
@@ -210,7 +212,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
 
   let contentIndex = 0;
   let textBlockIndex = -1;        // -1 = no text block currently open
-  
+
   const toolUseMap = {};
   let lastFinishReason = null;
   const streamUsage = { input_tokens: 0, output_tokens: 0 };
@@ -441,4 +443,3 @@ function mapAnthropicToolChoice(choice) {
   if (choice.type === "tool") return { type: "function", function: { name: choice.name } };
   return "auto";
 }
-

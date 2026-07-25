@@ -1,13 +1,13 @@
 // --- OpenAI Responses API -> OpenCode Chat Completions -----
 
-import { uid, now, extractText, streamSSE, resolveDefaultModel } from "./utils.js";
-import { extractUsage } from "./upstream.js";
+import { uid, now, extractText } from "../helpers.js";
+import { streamSSE } from "../stream.js";
+import { resolveDefaultModel } from "../config.js";
+import { extractUsage } from "../upstream.js";
 
 /**
  * Translate an OpenAI Responses API request body to OpenCode Chat Completions format.
  * @param {object} body - The Responses API request body
- * @param {object} [options] - Translation options
- * @param {string} [options.toolCallMode] - "native" (proper role:tool) or "compat" (user message fallback)
  */
 export function translateToChat(body) {
   const messages = [];
@@ -43,74 +43,76 @@ export function translateToChat(body) {
         continue;
       }
 
-    switch (item.type || "message") {
-      case "message": {
-        const role = item.role || "user";
-        const text = extractText(item.content);
-        if (role === "developer") {
-          if (text) systemParts.push(text);
+      switch (item.type || "message") {
+        case "message": {
+          const role = item.role || "user";
+          const text = extractText(item.content);
+          if (role === "developer") {
+            if (text) systemParts.push(text);
+            break;
+          }
+          messages.push({ role, content: text });
+          lastAssistantIdx = role === "assistant" ? messages.length - 1 : null;
           break;
         }
-        messages.push({ role, content: text });
-        lastAssistantIdx = role === "assistant" ? messages.length - 1 : null;
-        break;
-      }
 
-      case "function_call": {
-        const idx = ensureAssistant();
-        if (!messages[idx].tool_calls) messages[idx].tool_calls = []; (messages[idx].tool_calls).push({
-          id: item.call_id || uid("call"),
-          type: "function",
-          function: {
-            name: item.name || "",
-            arguments:
-              typeof item.arguments === "string"
-                ? item.arguments
-                : JSON.stringify(item.arguments || {}),
-          },
-        });
-        break;
-      }
-
-      case "function_call_output":
-      case "custom_tool_call_output": {
-        const output = typeof item.output === "string" ? item.output : extractText(item.output);
-        const callId = item.call_id || "";
-        messages.push({ role: "tool", tool_call_id: callId, content: output || "" });
-        lastAssistantIdx = null;
-        break;
-      }
-
-      case "local_shell_call":
-      case "custom_tool_call":
-      case "tool_search_call": {
-        const idx = ensureAssistant();
-        const name = item.type === "local_shell_call" ? "shell" : item.name || item.type;
-        if (!messages[idx].tool_calls) messages[idx].tool_calls = []; (messages[idx].tool_calls).push({
-          id: item.call_id || uid("call"),
-          type: "function",
-          function: { name, arguments: JSON.stringify(item.action || {}) },
-        });
-        break;
-      }
-
-      case "reasoning": {
-        const summary = extractText(item.summary || item.content || "");
-        if (summary) {
-          messages.push({
-            role: "assistant",
-            content: `[Previous reasoning: ${summary.slice(0, 500)}]`,
+        case "function_call": {
+          const idx = ensureAssistant();
+          if (!messages[idx].tool_calls) messages[idx].tool_calls = [];
+          messages[idx].tool_calls.push({
+            id: item.call_id || uid("call"),
+            type: "function",
+            function: {
+              name: item.name || "",
+              arguments:
+                typeof item.arguments === "string"
+                  ? item.arguments
+                  : JSON.stringify(item.arguments || {}),
+            },
           });
+          break;
         }
-        lastAssistantIdx = null;
-        break;
-      }
 
-      default: {
-        console.warn(`Unknown input item type "${item.type}" in translateToChat`);
-        break;
+        case "function_call_output":
+        case "custom_tool_call_output": {
+          const output = typeof item.output === "string" ? item.output : extractText(item.output);
+          const callId = item.call_id || "";
+          messages.push({ role: "tool", tool_call_id: callId, content: output || "" });
+          lastAssistantIdx = null;
+          break;
+        }
+
+        case "local_shell_call":
+        case "custom_tool_call":
+        case "tool_search_call": {
+          const idx = ensureAssistant();
+          const name = item.type === "local_shell_call" ? "shell" : item.name || item.type;
+          if (!messages[idx].tool_calls) messages[idx].tool_calls = [];
+          messages[idx].tool_calls.push({
+            id: item.call_id || uid("call"),
+            type: "function",
+            function: { name, arguments: JSON.stringify(item.action || {}) },
+          });
+          break;
+        }
+
+        case "reasoning": {
+          const summary = extractText(item.summary || item.content || "");
+          if (summary) {
+            messages.push({
+              role: "assistant",
+              content: `[Previous reasoning: ${summary.slice(0, 500)}]`,
+            });
+          }
+          lastAssistantIdx = null;
+          break;
+        }
+
+        default: {
+          console.warn(`Unknown input item type "${item.type}" in translateToChat`);
+          break;
+        }
       }
-    }
     }
   }
 
@@ -164,7 +166,7 @@ export function translateToChat(body) {
 
   // Reasoning/thinking
   if (body.reasoning?.effort && body.reasoning.effort !== "none") {
-    const effortMap = { low: "low", medium: "medium", high: "high" };
+    const effortMap = { low: "low", medium: "medium", high: "high", default: "high" };
     chat.thinking = {
       type: "enabled",
       reasoning_effort: effortMap[body.reasoning.effort] || "high",
