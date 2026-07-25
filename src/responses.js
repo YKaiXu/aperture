@@ -1,7 +1,7 @@
-// ─── OpenAI Responses API → OpenCode Chat Completions ─────
+// --- OpenAI Responses API -> OpenCode Chat Completions -----
 
-import { uid, now, extractText, streamSSE } from "./utils.js";
-import { sendChatRequest, extractUsage } from "./upstream.js";
+import { uid, now, extractText, streamSSE, resolveDefaultModel } from "./utils.js";
+import { extractUsage } from "./upstream.js";
 
 /**
  * Translate an OpenAI Responses API request body to OpenCode Chat Completions format.
@@ -13,7 +13,7 @@ export function translateToChat(body) {
   const messages = [];
   const systemParts = [];
 
-  // instructions → system message
+  // instructions -> system message
   if (body.instructions) {
     systemParts.push(
       typeof body.instructions === "string" ? body.instructions : extractText(body.instructions)
@@ -58,7 +58,7 @@ export function translateToChat(body) {
 
       case "function_call": {
         const idx = ensureAssistant();
-        (messages[idx].tool_calls ??= []).push({
+        if (!messages[idx].tool_calls) messages[idx].tool_calls = []; (messages[idx].tool_calls).push({
           id: item.call_id || uid("call"),
           type: "function",
           function: {
@@ -86,7 +86,7 @@ export function translateToChat(body) {
       case "tool_search_call": {
         const idx = ensureAssistant();
         const name = item.type === "local_shell_call" ? "shell" : item.name || item.type;
-        (messages[idx].tool_calls ??= []).push({
+        if (!messages[idx].tool_calls) messages[idx].tool_calls = []; (messages[idx].tool_calls).push({
           id: item.call_id || uid("call"),
           type: "function",
           function: { name, arguments: JSON.stringify(item.action || {}) },
@@ -105,6 +105,12 @@ export function translateToChat(body) {
         lastAssistantIdx = null;
         break;
       }
+
+      default: {
+        console.warn(`Unknown input item type "${item.type}" in translateToChat`);
+        break;
+      }
+    }
     }
   }
 
@@ -115,7 +121,7 @@ export function translateToChat(body) {
 
   // Build the chat request
   const chat = {
-    model: body.model || "deepseek-v4-flash",
+    model: body.model || resolveDefaultModel(),
     messages,
     stream: body.stream !== false,
   };
@@ -158,9 +164,10 @@ export function translateToChat(body) {
 
   // Reasoning/thinking
   if (body.reasoning?.effort && body.reasoning.effort !== "none") {
+    const effortMap = { low: "low", medium: "medium", high: "high" };
     chat.thinking = {
       type: "enabled",
-      reasoning_effort: body.reasoning.effort === "high" ? "high" : "max",
+      reasoning_effort: effortMap[body.reasoning.effort] || "high",
     };
   }
 
@@ -170,7 +177,7 @@ export function translateToChat(body) {
 /**
  * Translate upstream Chat Completion response chunk to Responses API SSE event.
  */
-export async function* translateStreamEvents(upstreamResponse, respId) {
+export async function* translateStreamEvents(upstreamResponse, respId, model = resolveDefaultModel()) {
   let outputIndex = 0;
   let textStarted = false;
   let fullText = "";
@@ -188,7 +195,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
         id: respId,
         object: "response",
         created_at: now(),
-        model: "deepseek-v4-flash",
+        model,
         output: [],
       },
     },
@@ -340,7 +347,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
         id: respId,
         object: "response",
         created_at: now(),
-        model: "deepseek-v4-flash",
+        model,
         output: [],
         usage: respUsage,
       },
@@ -351,21 +358,19 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
 /**
  * Translate upstream Chat Completion response to Responses API JSON format (non-streaming).
  */
-export async function translateResponseJson(upstreamResponse, respId) {
+export async function translateResponseJson(upstreamResponse, respId, model = resolveDefaultModel()) {
   const data = await upstreamResponse.json();
   const choice = data.choices?.[0];
   const message = choice?.message || {};
   const output = [];
 
-  if (message.content || !message.tool_calls) {
-    output.push({
-      id: uid("msg"),
-      type: "message",
-      role: "assistant",
-      status: "completed",
-      content: [{ type: "output_text", text: message.content || "", annotations: [] }],
-    });
-  }
+  output.push({
+    id: uid("msg"),
+    type: "message",
+    role: "assistant",
+    status: "completed",
+    content: [{ type: "output_text", text: message.content || "", annotations: [] }],
+  });
 
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
@@ -390,7 +395,7 @@ export async function translateResponseJson(upstreamResponse, respId) {
     id: respId,
     object: "response",
     created_at: now(),
-    model: "deepseek-v4-flash",
+    model,
     output,
     usage: data.usage
       ? {
@@ -402,7 +407,7 @@ export async function translateResponseJson(upstreamResponse, respId) {
   };
 }
 
-// ─── Internal helpers ──────────────────────────────
+// --- Internal helpers ------------------------------
 
 function makeTextDone(idx, text) {
   return { type: "response.output_text.done", output_index: idx, content_index: 0, text };

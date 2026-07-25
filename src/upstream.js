@@ -1,4 +1,4 @@
-// ─── Upstream API Client ─────────────────────────────────
+// --- Upstream API Client ---------------------------------
 // Routes through Cloudflare AI Gateway for caching + analytics.
 // Falls back to direct upstream on Gateway failure.
 
@@ -56,27 +56,33 @@ export async function sendChatRequest(env, chatBody) {
     timeout
   );
 
-  if (response.ok || response.status !== 400) return response;
+  // Pass through successful responses
+  if (response.ok) return response;
 
-  // Gateway 400 → fallback directly to upstream
+  // Gateway error (5xx) -> fallback directly to upstream
   const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
-  if (bypass || !(env.AI_GATEWAY_URL || "").trim()) return response; // already direct
+  const usingGateway = !bypass && (env.AI_GATEWAY_URL || "").trim();
 
-  const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
-  const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
+  if (response.status >= 500 && usingGateway) {
+    const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
+    const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 
-  return fetchUpstream(
-    fallbackUrl,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${fallbackKey}`,
+    return fetchUpstream(
+      fallbackUrl,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${fallbackKey}`,
+        },
+        body: JSON.stringify(chatBody),
       },
-      body: JSON.stringify(chatBody),
-    },
-    timeout
-  );
+      timeout
+    );
+  }
+
+  // Non-retryable error — return as-is to the caller
+  return response;
 }
 
 export function extractUsage(upstreamData) {
@@ -89,7 +95,4 @@ export function extractUsage(upstreamData) {
   };
 }
 
-export function getFinishReason(choice) {
-  return choice?.finish_reason || null;
-}
 

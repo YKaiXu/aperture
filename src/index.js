@@ -1,37 +1,34 @@
-// ─── OpenCode Go Proxy ─────────────────────────────────
-// Universal proxy: OpenAI Responses API + Anthropic Messages API → OpenCode Chat Completions
+// --- OpenCode Go Proxy ---------------------------------
+// Universal proxy: OpenAI Responses API + Anthropic Messages API -> OpenCode Chat Completions
 //
 // Routes:
-//   POST /                    → Auto-detect (Responses API by default)
-//   POST /v1/chat/completions → OpenAI Chat Completions passthrough
-//   POST /v1/messages         → Anthropic Messages API
+//   POST /                    -> Auto-detect (Responses API by default)
+//   POST /v1/chat/completions -> OpenAI Chat Completions passthrough
+//   POST /v1/messages         -> Anthropic Messages API
 //
 // Authentication:
 //   Authorization: Bearer <token>  (OpenAI style)
 //   x-api-key: <token>             (Anthropic style)
 
-import { uid, now, errorResponse, corsHeaders, authenticate, withTimeout, createRateLimiter } from "./utils.js";
+import { uid, now, errorResponse, corsHeaders, authenticate, createRateLimiter, resolveDefaultModel } from "./utils.js";
 import { sendChatRequest } from "./upstream.js";
 import { translateToChat, translateStreamEvents, translateResponseJson } from "./responses.js";
 import { translateAnthropicToChat, translateAnthropicStream, translateAnthropicJson } from "./anthropic.js";
 
-// ── Rate limiter (per-worker instance, in-memory) ────
-const rateLimiter = createRateLimiter(60000, 120);
-
 /**
  * Map client-provided model names to actual upstream model names.
  * Supports:
- * 1. Known provider names (go, go_proxy, default, auto) → DEFAULT_MODEL
+ * 1. Known provider names (go, go_proxy, default, auto) -> DEFAULT_MODEL
  * 2. Explicit model mappings via MODEL_MAP env var (JSON object)
  * 3. Everything else falls back to DEFAULT_MODEL (real model names are NOT passed through)
  */
 function mapModelName(model, env = {}) {
-  if (!model) return env.DEFAULT_MODEL || "deepseek-v4-flash";
+  if (!model) return resolveDefaultModel(env);
 
   const trimmed = String(model).toLowerCase().trim();
   const knownProviders = ["go", "go_proxy", "default", "auto"];
   if (knownProviders.includes(trimmed)) {
-    return env.DEFAULT_MODEL || "deepseek-v4-flash";
+    return resolveDefaultModel(env);
   }
 
   // Parse custom model map from environment (case-insensitive keys)
@@ -46,12 +43,12 @@ function mapModelName(model, env = {}) {
 
   // Fallback to default model for any unrecognized name
   // (so clients can use any arbitrary model alias)
-  return env.DEFAULT_MODEL || "deepseek-v4-flash";
+  return resolveDefaultModel(env);
 }
 
 export default {
   async fetch(request, env) {
-    // ── CORS preflight ─────────────────────────────────
+    // -- CORS preflight ---------------------------------
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders() });
     }
@@ -60,7 +57,7 @@ export default {
       return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
     }
 
-    // ── Rate Limiting (before auth to throttle brute force) ──────────────────────────────────
+    // -- Rate Limiting (before auth to throttle brute force) ----------------------------------
     const rateLimiter = createRateLimiter(
       Math.max(1000, parseInt(env.RATE_LIMIT_WINDOW_MS || "60000", 10) || 60000),
       Math.max(1, parseInt(env.RATE_LIMIT_MAX || "120", 10) || 120)
@@ -81,7 +78,7 @@ export default {
       );
     }
 
-    // ── Parse body ─────────────────────────────────────
+    // -- Parse body -------------------------------------
     let body;
     try {
       const raw = await request.text();
@@ -94,7 +91,11 @@ export default {
       return errorResponse("Invalid JSON body", "invalid_request", "PARSE_ERROR", 400);
     }
 
-    // ── Route detection ────────────────────────────────
+    // -- Authenticate (after rate limiting to avoid timing oracle) -----
+    const authResponse = authenticate(request, env);
+    if (authResponse) return authResponse;
+
+    // -- Route detection --------------------------------
     const path = new URL(request.url).pathname;
     const route = detectRoute(path, body);
 
@@ -107,7 +108,7 @@ export default {
   },
 };
 
-// ─── Route Detection ──────────────────────────────────
+// --- Route Detection ----------------------------------
 
 function detectRoute(path, body) {
   // Explicit paths
@@ -123,7 +124,7 @@ function detectRoute(path, body) {
   return "responses";
 }
 
-// ─── Chat Completions Passthrough ──────────────────────
+// --- Chat Completions Passthrough ----------------------
 
 /**
  * Pipe an async generator of event objects to a SSE Response.
@@ -205,13 +206,18 @@ function pipeChatStream(stream) {
  * This filter removes `reasoning_content` and skips chunks that only
  * contain reasoning (no actual content delta).
  */
-async function* filterChatStream(upstreamResponse) {
+export async function* filterChatStream(upstreamResponse) {
   const reader = upstreamResponse.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
   const MAX_BUFFER = 2 * 1024 * 1024; // 2 MB cap to prevent memory exhaustion
   while (true) {
     const { done, value } = await reader.read();
-    if (done) break;
+    if (done) {
+      if (buffer.trim()) {
+        console.warn("filterChatStream: discarding partial trailing SSE data", buffer.length);
+      }
+      break;
+    }
     buffer += value;
     if (buffer.length > MAX_BUFFER) {
       throw new Error("SSE buffer exceeded maximum size");
@@ -236,14 +242,15 @@ async function* filterChatStream(upstreamResponse) {
       try {
         parsed = JSON.parse(payload);
       } catch {
-        yield line; // malformed JSON — pass through
+        yield line; // malformed JSON -- pass through
         continue;
       }
       if (!parsed.choices || !Array.isArray(parsed.choices)) {
-        yield line; // no choices — pass through
+        yield line; // no choices -- pass through
         continue;
       }
       let modified = false;
+      let hadNullContent = false;
       for (const choice of parsed.choices) {
         if (!choice.delta) continue;
         // Strip reasoning_content (DeepSeek non-standard field)
@@ -251,18 +258,19 @@ async function* filterChatStream(upstreamResponse) {
           delete choice.delta.reasoning_content;
           modified = true;
         }
-        // Convert content: null → "" (some clients expect string content)
+        // Convert content: null -> "" (some clients expect string content)
         if (choice.delta.content === null) {
           choice.delta.content = "";
           modified = true;
+          hadNullContent = true;
         }
       }
       if (!modified) {
-        yield line; // nothing changed — pass through
+        yield line; // nothing changed -- pass through
         continue;
       }
-      // Keep meaningful chunks only — skip empty deltas that only had reasoning.
-      const hasContent = parsed.choices.some(c => {
+      // Keep meaningful chunks only -- skip empty deltas that only had reasoning.
+      const hasContent = hadNullContent || parsed.choices.some(c => {
         if (c.finish_reason) return true;
         if (!c.delta) return false;
         const d = c.delta;
@@ -280,9 +288,16 @@ async function* filterChatStream(upstreamResponse) {
 
 async function handleChatCompletions(body, env) {
   // Override model and passthrough
-  body.model = mapModelName(body.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+  body.model = mapModelName(body.model, env);
 
-  const upstreamResponse = await sendChatRequest(env, body);
+  let upstreamResponse;
+  try {
+    upstreamResponse = await sendChatRequest(env, body);
+  } catch (err) {
+    const log = createLogger("chat");
+    log.error("upstream.network_error", { message: err.message, stack: err.stack });
+    return errorResponse("Upstream request failed", "upstream_error", "UPSTREAM", 502);
+  }
   if (!upstreamResponse.ok) {
     const errBody = await safeReadUpstreamBody(upstreamResponse);
     // Log detailed upstream error server-side, return generic message to client
@@ -302,8 +317,9 @@ async function handleChatCompletions(body, env) {
   // Non-streaming: try DSML normalization, fallback to raw pass-through
   // IMPORTANT: upstreamResponse.body can only be consumed once.
   // Read as text first so we can retry if JSON.parse fails.
+  let responseText;
   try {
-    const responseText = await upstreamResponse.text();
+    responseText = await upstreamResponse.text();
     const responseBody = JSON.parse(responseText);
     // Strip non-standard reasoning_content for Trae compatibility
     for (const choice of responseBody.choices || []) {
@@ -325,7 +341,7 @@ async function handleChatCompletions(body, env) {
   }
 }
 
-// ─── Responses API Handler ────────────────────────────
+// --- Responses API Handler ----------------------------
 
 async function handleResponsesAPI(body, env) {
   const respId = uid("resp");
@@ -333,10 +349,23 @@ async function handleResponsesAPI(body, env) {
   // Translate to Chat Completions format
   const chatReq = translateToChat(body);
   // Map Codex provider names to actual model names
-  chatReq.model = mapModelName(chatReq.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+  chatReq.model = mapModelName(chatReq.model, env);
 
   // Send upstream
-  const upstreamResponse = await sendChatRequest(env, chatReq);
+  let upstreamResponse;
+  try {
+    upstreamResponse = await sendChatRequest(env, chatReq);
+  } catch (err) {
+    const log = createLogger("responses");
+    log.error("upstream.network_error", { message: err.message, stack: err.stack });
+    return new Response(
+      JSON.stringify({
+        id: respId, object: "response", created_at: now(), model: chatReq.model, output: [],
+        error: { message: "Upstream request failed", type: "invalid_request_error", code: "upstream_error" },
+      }),
+      { status: 502, headers: { "Content-Type": "application/json", ...corsHeaders() } }
+    );
+  }
   if (!upstreamResponse.ok) {
     const errMsg = await readUpstreamErrorSafe(upstreamResponse);
     // Log detailed upstream error server-side, return generic message to client
@@ -360,17 +389,17 @@ async function handleResponsesAPI(body, env) {
 
   // Streaming
   if (chatReq.stream) {
-    return pipeEventStream(translateStreamEvents(upstreamResponse, respId));
+    return pipeEventStream(translateStreamEvents(upstreamResponse, respId, chatReq.model));
   }
 
   // Non-streaming
-  const result = await translateResponseJson(upstreamResponse, respId);
+  const result = await translateResponseJson(upstreamResponse, respId, chatReq.model);
   return new Response(JSON.stringify(result), {
     headers: { "Content-Type": "application/json", ...corsHeaders() },
   });
 }
 
-// ─── Anthropic Messages API Handler ───────────────────
+// --- Anthropic Messages API Handler -------------------
 
 function anthropicHeaders(extra = {}) {
   const reqId = uid("req");
@@ -386,12 +415,25 @@ function anthropicHeaders(extra = {}) {
 async function handleAnthropicMessages(body, env) {
   const requestId = uid("msg");
 
-  // Translate Anthropic request → Chat Completions
-  const chatReq = translateAnthropicToChat(body);
-  chatReq.model = mapModelName(chatReq.model || env.DEFAULT_MODEL || "deepseek-v4-flash", env);
+  // Translate Anthropic request -> Chat Completions
+  const chatReq = translateAnthropicToChat(body, env);
+  chatReq.model = mapModelName(chatReq.model, env);
 
   // Send upstream
-  const upstreamResponse = await sendChatRequest(env, chatReq);
+  let upstreamResponse;
+  try {
+    upstreamResponse = await sendChatRequest(env, chatReq);
+  } catch (err) {
+    const log = createLogger("anthropic");
+    log.error("upstream.network_error", { message: err.message, stack: err.stack });
+    return new Response(
+      JSON.stringify({
+        id: requestId, type: "error",
+        error: { type: "upstream_error", message: "Upstream request failed" },
+      }),
+      { status: 502, headers: anthropicHeaders() }
+    );
+  }
   if (!upstreamResponse.ok) {
     const errMsg = await readUpstreamErrorSafe(upstreamResponse);
     // Log detailed upstream error server-side, return generic message to client
@@ -412,14 +454,14 @@ async function handleAnthropicMessages(body, env) {
 
   // Streaming
   if (chatReq.stream) {
-    return pipeEventStream(translateAnthropicStream(upstreamResponse, requestId), {
+    return pipeEventStream(translateAnthropicStream(upstreamResponse, requestId, chatReq.model), {
       "x-request-id": requestId,
       "request-id": requestId,
     });
   }
 
   // Non-streaming
-  const result = await translateAnthropicJson(upstreamResponse, requestId);
+  const result = await translateAnthropicJson(upstreamResponse, requestId, chatReq.model);
   return new Response(JSON.stringify(result), {
     headers: {
       "Content-Type": "application/json",
@@ -430,16 +472,16 @@ async function handleAnthropicMessages(body, env) {
   });
 }
 
-// ─── Internal Helpers ─────────────────────────────────
+// --- Internal Helpers ---------------------------------
 
 /**
  * Detect and convert Console Go DSML tool calls to standard OpenAI tool_calls format.
- * 
+ *
  * Console Go sometimes returns tool calls as DSML XML embedded in the content text
  * (with finish_reason: "stop") instead of standard message.tool_calls format.
  * This function detects this pattern and normalizes it.
  */
-function normalizeDsmlToolCalls(responseBody) {
+export function normalizeDsmlToolCalls(responseBody) {
   if (!responseBody?.choices?.[0]?.message) return responseBody;
   const choice = responseBody.choices[0];
   const msg = choice.message;
@@ -467,21 +509,29 @@ function normalizeDsmlToolCalls(responseBody) {
       if (pMatch[1]) args[pMatch[1]] = pMatch[2].trim() || "";
     }
 
-    toolCalls.push({
-      index: toolCalls.length,
-      id: `call_dsml_${uid("")}`,
-      type: "function",
-      function: {
-        name: fnName,
-        arguments: JSON.stringify(args),
-      },
-    });
+    if (Object.keys(args).length > 0) {
+      toolCalls.push({
+        index: toolCalls.length,
+        id: `call_dsml_${uid("")}`,
+        type: "function",
+        function: {
+          name: fnName,
+          arguments: JSON.stringify(args),
+        },
+      });
+    }
   }
 
   if (toolCalls.length === 0) return responseBody;
 
-  // Build cleaned response
-  msg.content = ""; // DSML content replaced with empty string
+  // Preserve any non-DSML text from the original content
+  // Remove complete DSML invoke blocks including delimiters
+  let prose = content.replace(/<invoke\s+name\s*=\s*"[^"]*"[\s\S]*?<\/invoke>/gi, "").trim();
+  if (prose) {
+    msg.content = prose; // Keep non-DSML prose as content
+  } else {
+    msg.content = ""; // Pure DSML content replaced with empty
+  }
   msg.tool_calls = toolCalls;
   if (choice.finish_reason === "stop" || choice.finish_reason === "length") {
     choice.finish_reason = "tool_calls";

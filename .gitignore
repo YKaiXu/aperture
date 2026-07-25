@@ -6,7 +6,13 @@ node_modules/
 *.log
 wrangler.toml
 .wrangler/
+.claude/
+.omo/
 tests/
 CODEBUDDY.md
 vitest.config.mjs
+vitest.config.js
 aperture-code-review-report.md
+*.bak
+responses_*.js
+test_nullish*.js

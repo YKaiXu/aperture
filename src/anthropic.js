@@ -1,7 +1,6 @@
-// ─── Anthropic Messages API → OpenCode Chat Completions ───
+// --- Anthropic Messages API -> OpenCode Chat Completions ---
 
-import { uid, now, extractText, streamSSE } from "./utils.js";
-import { sendChatRequest, extractUsage, getFinishReason } from "./upstream.js";
+import { uid, now, extractText, streamSSE, resolveDefaultModel } from "./utils.js";
 
 /**
  * Translate an Anthropic Messages API request body to OpenCode Chat Completions format.
@@ -10,12 +9,12 @@ import { sendChatRequest, extractUsage, getFinishReason } from "./upstream.js";
  * - messages[] with role: user/assistant
  * - system prompt (as top-level field or first system message)
  * - content blocks (text, image, tool_use, tool_result, thinking)
- * - tools[] definitions → OpenAI function calling
+ * - tools[] definitions -> OpenAI function calling
  * - streaming via stream: true
  * - thinking config
- * - Anthropic-style image blocks → OpenAI image URL format
+ * - Anthropic-style image blocks -> OpenAI image URL format
  */
-export function translateAnthropicToChat(body) {
+export function translateAnthropicToChat(body, env) {
   const messages = [];
   let systemContent = null;
   let lastAssistantIdx = null;
@@ -81,18 +80,23 @@ export function translateAnthropicToChat(body) {
     if (msg.role === "assistant") {
       const toolCalls = [];
       let text = "";
-      for (const block of (Array.isArray(msg.content) ? msg.content : [msg.content])) {
-        if (block.type === "text") {
-          text += block.text || "";
-        } else if (block.type === "tool_use") {
-          toolCalls.push({
-            id: block.id || uid("call"),
-            type: "function",
-            function: {
-              name: block.name || "",
-              arguments: JSON.stringify(block.input || {}),
-            },
-          });
+      // Handle plain string content directly (not wrapped in content blocks)
+      if (typeof msg.content === "string") {
+        text = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        for (const block of msg.content) {
+          if (block.type === "text") {
+            text += block.text || "";
+          } else if (block.type === "tool_use") {
+            toolCalls.push({
+              id: block.id || uid("call"),
+              type: "function",
+              function: {
+                name: block.name || "",
+                arguments: JSON.stringify(block.input || {}),
+              },
+            });
+          }
         }
       }
       messages.push({
@@ -121,7 +125,7 @@ export function translateAnthropicToChat(body) {
 
   // Build chat request
   const chat = {
-    model: translateModel(body.model),
+    model: translateModel(body.model, env),
     messages,
     stream: body.stream !== false,
   };
@@ -141,7 +145,7 @@ export function translateAnthropicToChat(body) {
   // on chain-of-thought and leave the actual answer empty.
   chat.max_tokens = Math.max(chat.max_tokens, 1024);
 
-  // Tools → function calling
+  // Tools -> function calling
   if (body.tools && body.tools.length > 0) {
     const tools = [];
     for (const t of body.tools) {
@@ -164,7 +168,7 @@ export function translateAnthropicToChat(body) {
     }
   }
 
-  // Thinking → reasoning effort
+  // Thinking -> reasoning effort
   if (body.thinking && body.thinking.type === "enabled") {
     chat.thinking = {
       type: "enabled",
@@ -185,7 +189,7 @@ export function translateAnthropicToChat(body) {
  * Since upstream returns Chat Completions format, we emit SSE events
  * that an Anthropic client can consume.
  */
-export async function* translateAnthropicStream(upstreamResponse, requestId, model = "deepseek-v4-flash") {
+export async function* translateAnthropicStream(upstreamResponse, requestId, model = resolveDefaultModel()) {
   // Emit the start-of-stream event for Anthropic
   yield {
     event: "message_start",
@@ -225,12 +229,12 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
       const finishReason = choice.finish_reason;
       if (finishReason) lastFinishReason = finishReason;
 
-      // Reasoning content: silently ignore. Do NOT emit any SSE events —
+      // Reasoning content: silently ignore. Do NOT emit any SSE events --
       // emitting empty text deltas for each reasoning chunk causes Claude CLI
       // to hang (it receives 50-200 empty text deltas before any real content).
       // The model's actual text or tool_call output will create its own block.
       if (reasoning) {
-        // skip — reasoning is not a standard Anthropic content block type
+        // skip -- reasoning is not a standard Anthropic content block type
       }
 
       // Text content: open the text block ONCE, accumulate deltas, close ONCE.
@@ -342,7 +346,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
     data: {
       type: "message_delta",
       delta: { stop_reason: stopReason, stop_sequence: null },
-      usage: { output_tokens: streamUsage.output_tokens },
+      usage: { input_tokens: streamUsage.input_tokens, output_tokens: streamUsage.output_tokens },
     },
   };
 
@@ -355,7 +359,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
 /**
  * Translate a complete upstream Chat Completion response to Anthropic Messages JSON format.
  */
-export async function translateAnthropicJson(upstreamResponse, requestId, model = "deepseek-v4-flash") {
+export async function translateAnthropicJson(upstreamResponse, requestId, model = resolveDefaultModel()) {
   const data = await upstreamResponse.json();
   const choice = data.choices?.[0];
   const message = choice?.message || {};
@@ -366,7 +370,7 @@ export async function translateAnthropicJson(upstreamResponse, requestId, model 
     content.push({ type: "text", text: message.content });
   }
 
-  // Tool calls → tool_use blocks
+  // Tool calls -> tool_use blocks
   if (message.tool_calls) {
     for (const tc of message.tool_calls) {
       let input;
@@ -405,19 +409,20 @@ export async function translateAnthropicJson(upstreamResponse, requestId, model 
   };
 }
 
-// ─── Internal helpers ──────────────────────────────
+// --- Internal helpers ------------------------------
 
 function translateModel(model, env) {
-  if (!model) return env?.DEFAULT_MODEL || "deepseek-v4-flash";
+  if (!model) return resolveDefaultModel(env);
   // Map common Anthropic model names to our model
+  const def = resolveDefaultModel(env);
   const modelMap = {
-    "claude-sonnet-4-20250514": env?.DEFAULT_MODEL || "deepseek-v4-flash",
-    "claude-sonnet-4": env?.DEFAULT_MODEL || "deepseek-v4-flash",
-    "claude-3-5-sonnet-latest": env?.DEFAULT_MODEL || "deepseek-v4-flash",
-    "claude-3-haiku": env?.DEFAULT_MODEL || "deepseek-v4-flash",
-    "claude-3-opus": env?.DEFAULT_MODEL || "deepseek-v4-flash",
+    "claude-sonnet-4-20250514": def,
+    "claude-sonnet-4": def,
+    "claude-3-5-sonnet-latest": def,
+    "claude-3-haiku": def,
+    "claude-3-opus": def,
   };
-  return modelMap[model] || env?.DEFAULT_MODEL || "deepseek-v4-flash";
+  return modelMap[model] || def;
 }
 
 function mapFinishReason(fr) {
@@ -431,43 +436,9 @@ function mapFinishReason(fr) {
 
 function mapAnthropicToolChoice(choice) {
   if (!choice) return "auto";
-  if (choice.type === "any" || choice.type === "auto") return "auto";
+  if (choice.type === "auto") return "auto";
+  if (choice.type === "any") return "required"; // forced tool use — upstream supports "required"
   if (choice.type === "tool") return { type: "function", function: { name: choice.name } };
   return "auto";
 }
 
-function translateAnthropicContent(content) {
-  if (typeof content === "string") {
-    return { text: content, images: [] };
-  }
-  if (Array.isArray(content)) {
-    let text = "";
-    const images = [];
-    for (const block of content) {
-      if (block.type === "text") {
-        text += block.text || "";
-      } else if (block.type === "image") {
-        // Anthropic image → OpenAI image URL (for multimodal models)
-        if (block.source?.data) {
-          images.push({
-            type: "image_url",
-            image_url: {
-              url: `data:${block.source.media_type || "image/png"};base64,${block.source.data}`,
-            },
-          });
-        }
-      } else if (block.type === "tool_result") {
-        // Already handled at message level
-        text += extractText(block.content) || "";
-      } else if (block.type === "tool_use") {
-        // Already handled at message level
-      } else if (block.type === "thinking") {
-        text += `[Thinking: ${block.thinking || ""}]`;
-      } else if (block.type === "redacted_thinking") {
-        text += "[Redacted thinking]";
-      }
-    }
-    return { text: text || "...", images };
-  }
-  return { text: "", images: [] };
-}

@@ -1,4 +1,4 @@
-// ─── Utilities ───────────────────────────────────────────
+// --- Utilities -------------------------------------------
 // Shared defaults
 export const DEFAULT_MODEL = "deepseek-v4-flash";
 export const MIN_MAX_TOKENS = 1024;
@@ -88,6 +88,7 @@ export function corsHeaders(extra = {}) {
 /**
  * Validate authentication.
  * Supports: Authorization: Bearer <token> (OpenAI style) and x-api-key (Anthropic style)
+ * Returns null on success or a 401 Response on failure.
  */
 export function authenticate(request, env) {
   const expected = env.AI_GATEWAY_TOKEN;
@@ -95,7 +96,7 @@ export function authenticate(request, env) {
     // Log config error server-side but return 401 to avoid leaking configuration state
     const log = createLogger("auth");
     log.error("auth.missing_token", { message: "AI_GATEWAY_TOKEN not configured" });
-    return { ok: false, error: "Invalid or missing API key", code: "UNAUTHORIZED", status: 401 };
+    return errorResponse("Invalid or missing API key", "authentication_error", "UNAUTHORIZED", 401);
   }
   // Try Authorization: Bearer first, then x-api-key
   let token = null;
@@ -107,14 +108,14 @@ export function authenticate(request, env) {
     token = request.headers.get("x-api-key");
   }
   if (!token || token !== expected) {
-    return { ok: false, error: "Invalid or missing API key", code: "UNAUTHORIZED", status: 401 };
+    return errorResponse("Invalid or missing API key", "authentication_error", "UNAUTHORIZED", 401);
   }
-  return { ok: true };
+  return null; // auth passed
 }
 
 
 
-// ─── Structured Logger ────────────────────────────────
+// --- Structured Logger --------------------------------
 
 /**
  * Create a structured JSON logger for Cloudflare Workers observability.
@@ -152,33 +153,7 @@ export function createLogger(requestId = "unknown") {
   };
 }
 
-// ─── SSE Stream Utilities (shared across handlers) ────
-
-/**
- * Parse a ReadableStream into an async generator of parsed JSON chunks
- * (Chat Completions SSE format — "data: {...}").
- */
-export async function* parseChatSSE(response) {
-  if (!response?.body) return;
-  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
-  let buffer = "";
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += value;
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data: ")) continue;
-      const payload = trimmed.slice(6).trim();
-      if (payload === "[DONE]") continue;
-      try {
-        yield JSON.parse(payload);
-      } catch { /* skip malformed chunks */ }
-    }
-  }
-}
+// --- SSE Stream Utilities (shared across handlers) ----
 
 /**
  * Parse a SSE stream from a Response into parsed JSON objects.
@@ -188,10 +163,15 @@ export async function* streamSSE(response) {
   if (!response?.body) return;
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
+  const MAX_BUFFER = 2 * 1024 * 1024; // 2 MB cap
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += value;
+    if (buffer.length > MAX_BUFFER) {
+      reader.cancel();
+      throw new Error("SSE buffer exceeded maximum size");
+    }
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
     for (const line of lines) {
@@ -256,11 +236,3 @@ export function createRateLimiter(windowMs, maxRequests) {
   };
 }
 
-/**
- * Create an AbortController with timeout.
- */
-export function withTimeout(ms) {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), ms);
-  return { controller, timer, signal: controller.signal };
-}
