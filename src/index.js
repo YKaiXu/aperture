@@ -23,7 +23,7 @@ const rateLimiter = createRateLimiter(60000, 120);
  * Supports:
  * 1. Known provider names (go, go_proxy, default, auto) → DEFAULT_MODEL
  * 2. Explicit model mappings via MODEL_MAP env var (JSON object)
- * 3. Everything else passes through (real model names like deepseek-v4-flash)
+ * 3. Everything else falls back to DEFAULT_MODEL (real model names are NOT passed through)
  */
 function mapModelName(model, env = {}) {
   if (!model) return env.DEFAULT_MODEL || "deepseek-v4-flash";

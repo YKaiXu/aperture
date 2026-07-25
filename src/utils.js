@@ -181,54 +181,6 @@ export async function* parseChatSSE(response) {
 }
 
 /**
- * Create a pipe function that writes items from an async generator to a SSE Response.
- *
- * @param {(item: any) => string} serialize - Converts a generator item to a text line (without trailing newline).
- * @returns {(stream: AsyncGenerator, extraHeaders?: object) => Response}
- */
-function createPipeStream(serialize) {
-  return (stream, extraHeaders = {}) => {
-    const { readable, writable } = new TransformStream();
-    const writer = writable.getWriter();
-    const encoder = new TextEncoder();
-
-    (async () => {
-      try {
-        for await (const item of stream) {
-          await writer.write(encoder.encode(serialize(item) + "\n"));
-        }
-      } catch { /* ignore write errors if client disconnected */ }
-      finally {
-        try { await writer.close(); } catch { /* ignore */ }
-      }
-    })();
-
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-        ...extraHeaders,
-        ...corsHeaders(),
-      },
-    });
-  };
-}
-
-/** Pipe an async generator of { event, data } objects as SSE events. */
-export const pipeEventStream = createPipeStream(
-  ({ event, data }) => `event: ${event}\ndata: ${JSON.stringify(data)}`
-);
-
-/** Pipe an async generator of raw text lines. */
-export const pipeChatStream = createPipeStream(
-  (line) => line
-);
-
-
-
-
-/**
  * Parse a SSE stream from a Response into parsed JSON objects.
  * Yields each "data: {...}" line as a parsed object.
  */
