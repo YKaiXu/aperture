@@ -1,0 +1,35 @@
+# Git History
+
+## Commits (most recent first)
+
+```
+c6013f1 fix: add missing exports to utils.js (streamSSE, fetchUpstream, createRateLimiter, withTimeout)
+  Author: YKaiXu
+  Date:   2026-07-25
+  
+  Added 4 exported functions to src/utils.js that were lost during git rebase conflict resolution.
+  Files: src/utils.js
+
+bf64380 fix: accumulate aperture improvements (filterChatStream empty deltas, BYPASS_GATEWAY, SSE consolidation, DSML regex, extractText optimizations)
+  Author: YKaiXu
+  Date:   2026-07-25
+  
+  Major improvement commit containing all optimization changes:
+  - filterChatStream: skip empty reasoning deltas (8 lines)
+  - BYPASS_GATEWAY env var for direct upstream
+  - SSE stream parser consolidation (removed 2 duplicates)
+  - DSML regex: multi-line parameter support
+  - extractText: O(n*k)→O(n) optimization
+  - Streaming tool name fallback
+  - wrangler.jsonc: worker name → g2o, added BYPASS_GATEWAY, timeout, rate-limit
+  Files: src/anthropic.js, src/index.js, src/responses.js, src/upstream.js, src/utils.js, wrangler.jsonc
+
+d4dbb12 fix: 修复 Anthropic 协议工具调用多轮对话兼容性 (previous commit)
+```
+
+## Branch
+- `main` at `github.com/YKaiXu/aperture`
+- Deployed to `g2o.blogger.workers.dev`
+
+## Unpushed Changes
+- None — all changes committed and pushed
