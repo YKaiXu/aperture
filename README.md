@@ -94,12 +94,13 @@ curl https://g2o.blogger.workers.dev/ \
 | 变量 | 说明 | 默认值 |
 |---|---|---|
 | `UPSTREAM_BASE_URL` | 上游 API 地址 | `https://opencode.ai/zen/go/v1` |
-| `AI_GATEWAY_URL` | Cloudflare AI Gateway 地址（可选） | — |
 | `AI_GATEWAY_TOKEN` | API 认证令牌 | — |
 | `OPENCODE_API_KEY` | 上游 API Key | — |
 | `DEFAULT_MODEL` | 默认模型名 | `deepseek-v4-flash` |
 | `MODEL_MAP` | 模型名映射 JSON | `{"dv4f":"deepseek-v4-flash"}` |
-| `BYPASS_GATEWAY` | 跳过 AI Gateway | `false` |
+| `USE_GATEWAY` | 显式启用 AI Gateway 路由 | `false`（直连） |
+| `AI_GATEWAY_URL` | Cloudflare AI Gateway 地址（secret 设置） | — |
+| `BYPASS_GATEWAY` | (旧) 跳过 AI Gateway，由 USE_GATEWAY 替代 | `false` |
 | `REQUEST_TIMEOUT_MS` | 超时毫秒数 | `120000` |
 | `RATE_LIMIT_MAX` | 限流窗口最大请求数 | `120` |
 | `RATE_LIMIT_WINDOW_MS` | 限流窗口 (ms) | `60000` |
@@ -132,7 +133,14 @@ DeepSeek 模型有时使用 XML 格式的 tool calling。Aperture 自动检测�
 
 ## Cloudflare AI Gateway
 
-Aperture 原生支持 AI Gateway。当 Gateway 返回 5xx 时自动回退直连上游。
+Aperture 原生支持 AI Gateway。通过 `USE_GATEWAY=true` 启用（默认直连）：
+
+```bash
+wrangler secret put AI_GATEWAY_URL  # 设置 Gateway 地址（含 Account ID）
+wrangler secret put USE_GATEWAY true  # 启用 Gateway 路由
+```
+
+Gateway 模式下，上游 5xx 会自动回退直连上游。
 
 ## 测试
 

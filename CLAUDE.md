@@ -116,15 +116,17 @@ return errorResponse("Upstream request failed", "upstream_error", "UPSTREAM", st
 ### 5.1 环境变量
 - 数值变量（`RATE_LIMIT_MAX`、`RATE_LIMIT_WINDOW_MS`、`REQUEST_TIMEOUT_MS`）在 `wrangler.jsonc` 中以字符串形式定义，运行时解析
 - `DEFAULT_MODEL` 是默认模型名，可通过 `env.DEFAULT_MODEL` 覆盖
-- `BYPASS_GATEWAY` 默认应为 `"false"`，让 Gateway 路径生效
+- `USE_GATEWAY` 控制是否走 AI Gateway；`wrangler.jsonc` 中默认 `"false"`（直连模式）
+  - 直连时无需设置 `AI_GATEWAY_URL`，避免配置残留导致误走 Gateway
+  - 启用 Gateway：`wrangler secret put USE_GATEWAY true` + 设置 `AI_GATEWAY_URL` secret
 
 ### 5.2 限流器
 - 限流器在 `fetch()` 内实例化（可读取 `env`），不能模块级硬编码
 - `hits` Map 必须定期清理过期条目，防内存泄漏
 
 ### 5.3 部署检查清单
-- [ ] `wrangler.jsonc` 中 `BYPASS_GATEWAY` 已按需设置
-- [ ] `AI_GATEWAY_TOKEN` 和 `AI_GATEWAY_URL` secrets 已设置
+- [ ] `wrangler.jsonc` 中 `USE_GATEWAY` 已按需设置（`false`=直连，`true`=Gateway）
+- [ ] `AI_GATEWAY_TOKEN` secret 已设置（必填）；`AI_GATEWAY_URL`（Gateway 模式必填）
 - [ ] `npm test` 通过（所有测试存在且通过）
 - [ ] 无硬编码模型名残留（搜索 `"deepseek-v4-flash"` 确认）
 
