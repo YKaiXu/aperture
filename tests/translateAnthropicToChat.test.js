@@ -109,7 +109,7 @@ describe("translateAnthropicToChat", () => {
     expect(assistant.tool_calls[0].function.arguments).toBe('{"city":"NYC"}');
   });
 
-  it("translates tool_result blocks to user text", () => {
+  it("translates tool_result blocks to tool messages", () => {
     const result = translateAnthropicToChat({
       messages: [
         {
@@ -125,8 +125,9 @@ describe("translateAnthropicToChat", () => {
       ],
     });
     expect(result.messages[0]).toEqual({
-      role: "user",
-      content: [{ type: "text", text: "Sunny, 72F" }],
+      role: "tool",
+      tool_call_id: "toolu_123",
+      content: "Sunny, 72F",
     });
   });
 
@@ -252,7 +253,9 @@ describe("translateAnthropicToChat", () => {
         },
       ],
     });
-    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].tool_call_id).toBe("toolu_123");
+    expect(result.messages[0].content).toBe("Result part 1");
   });
 
   it("handles role: tool as tool_result", () => {
@@ -262,7 +265,8 @@ describe("translateAnthropicToChat", () => {
       ],
     });
     expect(result.messages[0]).toEqual({
-      role: "user",
+      role: "tool",
+      tool_call_id: "toolu_456",
       content: "Tool output",
     });
   });

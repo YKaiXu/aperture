@@ -663,9 +663,10 @@ describe("translateAnthropicToChat – extra edge cases", () => {
     const result = translateAnthropicToChat({
       messages: [{ role: "user", content: [] }],
     });
-    // Empty array means the blocks loop produces no contentParts,
-    // so the user message is silently dropped.
-    expect(result.messages).toHaveLength(0);
+    // Empty array means no blocks to process;
+    // the else clause pushes an empty user message.
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toEqual({ role: "user", content: "" });
   });
 
   it("handles user message with non-array non-string content (fallback)", () => {
@@ -685,7 +686,7 @@ describe("translateAnthropicToChat – extra edge cases", () => {
   });
 
   // ------ tool_result blocks in user content ------
-  it("converts tool_result blocks in user content to text", () => {
+  it("emits tool_result as separate tool message and keeps user text separate", () => {
     const result = translateAnthropicToChat({
       messages: [
         {
@@ -701,12 +702,15 @@ describe("translateAnthropicToChat – extra edge cases", () => {
         },
       ],
     });
-    expect(result.messages[0].role).toBe("user");
-    // The code joins tool_result content with \n separator
-    expect(result.messages[0].content[0].text).toBe("The result was:\n42");
+    // tool message first (response to prior tool_calls), then user text
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].tool_call_id).toBe("tu_abc");
+    expect(result.messages[0].content).toBe("42");
+    expect(result.messages[1].role).toBe("user");
+    expect(result.messages[1].content).toBe("The result was:");
   });
 
-  it("converts tool_result with array content via extractText", () => {
+  it("converts tool_result with array content via extractText and emits as tool role", () => {
     const result = translateAnthropicToChat({
       messages: [
         {
@@ -721,12 +725,10 @@ describe("translateAnthropicToChat – extra edge cases", () => {
         },
       ],
     });
-    expect(result.messages[0].role).toBe("user");
-    if (Array.isArray(result.messages[0].content)) {
-      expect(result.messages[0].content[0].text).toBe("Result data");
-    } else {
-      expect(result.messages[0].content).toBe("Result data");
-    }
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].tool_call_id).toBe("tu_def");
+    expect(result.messages[0].content).toBe("Result data");
   });
 
   it("handles tool_result with missing content", () => {
@@ -740,8 +742,11 @@ describe("translateAnthropicToChat – extra edge cases", () => {
         },
       ],
     });
-    // No user message should be pushed since contentParts has no text
-    expect(result.messages).toHaveLength(0);
+    // Emitted as tool message with empty content
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].tool_call_id).toBe("tu_empty");
+    expect(result.messages[0].content).toBe("");
   });
 
   // ------ assistant with tool_use blocks ------
@@ -827,7 +832,8 @@ describe("translateAnthropicToChat – extra edge cases", () => {
       ],
     });
     const toolMsg = result.messages[2];
-    expect(toolMsg.role).toBe("user");
+    expect(toolMsg.role).toBe("tool");
+    expect(toolMsg.tool_call_id).toBe("tu_3");
     expect(toolMsg.content).toBe("The answer is 42");
   });
 
@@ -841,7 +847,8 @@ describe("translateAnthropicToChat – extra edge cases", () => {
         },
       ],
     });
-    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].tool_call_id).toBe("tu_4");
     expect(result.messages[0].content).toBe("Tool result text");
   });
 
@@ -851,7 +858,8 @@ describe("translateAnthropicToChat – extra edge cases", () => {
         { role: "tool", tool_use_id: "tu_5" },
       ],
     });
-    expect(result.messages[0].role).toBe("user");
+    expect(result.messages[0].role).toBe("tool");
+    expect(result.messages[0].tool_call_id).toBe("tu_5");
     expect(result.messages[0].content).toBe("");
   });
 

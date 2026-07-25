@@ -39,18 +39,21 @@ export function translateAnthropicToChat(body, env) {
 
     if (msg.role === "user") {
       // A user message can contain text, image, and tool_result blocks.
-      // tool_result blocks are converted to user text for upstream compatibility.
+      // tool_result blocks are emitted as role: "tool" (native OpenAI format)
+      // so the upstream can properly match them to preceding tool_calls.
       if (typeof msg.content === "string") {
         messages.push({ role: "user", content: msg.content });
       } else if (Array.isArray(msg.content)) {
-        let text = "";
-        const images = [];
+        const userParts = [];
+        let hasUserText = false;
+        const toolMessages = [];
         for (const block of msg.content) {
           if (block.type === "text") {
-            text += block.text || "";
+            userParts.push({ type: "text", text: block.text || "" });
+            hasUserText = true;
           } else if (block.type === "image") {
             if (block.source?.data) {
-              images.push({
+              userParts.push({
                 type: "image_url",
                 image_url: {
                   url: `data:${block.source.media_type || "image/png"};base64,${block.source.data}`,
@@ -58,19 +61,28 @@ export function translateAnthropicToChat(body, env) {
               });
             }
           } else if (block.type === "tool_result") {
-            // Compat mode: convert tool result to user text since the
-            // upstream API rejects role:"tool" messages.
-            const out = typeof block.content === "string"
+            const content = typeof block.content === "string"
               ? block.content
               : extractText(block.content);
-            text += (text ? "\n" : "") + (out || "");
+            toolMessages.push({
+              role: "tool",
+              tool_call_id: block.tool_use_id || uid("call"),
+              content: content || "",
+            });
           }
         }
-        const contentParts = [];
-        if (text) contentParts.push({ type: "text", text });
-        if (images.length > 0) contentParts.push(...images);
-        if (contentParts.length > 0) {
-          messages.push({ role: "user", content: contentParts });
+        // Emit tool messages first (they are responses to prior assistant tool_calls),
+        // then user text (the new prompt for this turn).
+        if (toolMessages.length > 0) {
+          messages.push(...toolMessages);
+        }
+        if (hasUserText || userParts.some((p) => p.type === "image_url")) {
+          messages.push({
+            role: "user",
+            content: userParts.length === 1 ? userParts[0].text : userParts,
+          });
+        } else if (toolMessages.length === 0) {
+          messages.push({ role: "user", content: "" });
         }
       } else {
         messages.push({ role: "user", content: "" });
@@ -110,13 +122,16 @@ export function translateAnthropicToChat(body, env) {
     }
 
     if (msg.role === "tool_result" || msg.role === "tool") {
-      // Convert tool results to user text for upstream compatibility.
       const content = typeof msg.content === "string"
         ? msg.content
         : Array.isArray(msg.content)
           ? msg.content.map((b) => extractText(b)).join("\n")
           : "";
-      messages.push({ role: "user", content: content || "" });
+      messages.push({
+        role: "tool",
+        tool_call_id: msg.tool_use_id || uid("call"),
+        content: content || "",
+      });
     }
   }
 
