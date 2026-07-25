@@ -26,6 +26,8 @@ export default {
 
     if (request.method !== "POST") return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
 
+    // Rate limiter is per-request (best-effort within Workers isolate model).
+    // CF edge provides DDoS protection — this is an additional soft throttle.
     const rateLimiter = createRateLimiter(
       Math.max(1000, parseInt(env.RATE_LIMIT_WINDOW_MS || "60000", 10) || 60000),
       Math.max(1, parseInt(env.RATE_LIMIT_MAX || "120", 10) || 120)

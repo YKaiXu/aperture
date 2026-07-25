@@ -8,7 +8,7 @@ wrangler.toml
 .wrangler/
 .claude/
 .omo/
-tests/
+coverage/
 CODEBUDDY.md
 vitest.config.mjs
 vitest.config.js
