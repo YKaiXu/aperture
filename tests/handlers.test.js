@@ -238,6 +238,28 @@ describe("handleChatCompletions", () => {
     expect(data.choices[0].message.content).toBe("Answer");
   });
 
+  it("non-streaming path strips reasoning_content with multiple choices", async () => {
+    const body = { ...baseBody, stream: false };
+    const env = {};
+    const signal = new AbortController().signal;
+
+    const upstreamData = {
+      choices: [
+        { message: { content: "Answer1", reasoning_content: "deepseek thinking" }, finish_reason: "stop" },
+        { message: { content: "Answer2" }, finish_reason: "stop" },
+      ],
+    };
+    sendChatRequest.mockResolvedValue(mockResponseBody(upstreamData));
+
+    const result = await handleChatCompletions(body, env, signal);
+    expect(result.status).toBe(200);
+    const data = await result.json();
+    expect(data.choices[0].message.reasoning_content).toBeUndefined();
+    expect(data.choices[0].message.content).toBe("Answer1");
+    expect(data.choices[1].message.reasoning_content).toBeUndefined();
+    expect(data.choices[1].message.content).toBe("Answer2");
+  });
+
   it("non-streaming with DSML tool calls normalizes via normalizeDsmlToolCalls", async () => {
     const body = { ...baseBody, stream: false };
     const env = {};
@@ -652,5 +674,22 @@ describe("filterChatStream", () => {
     const resp = makeSseResponse(['data: {"usage":{"prompt_tokens":10}}']);
     const lines = await collectLines(filterChatStream(resp));
     expect(lines).toContain('data: {"usage":{"prompt_tokens":10}}');
+  });
+
+  it("handles chunk with choices missing delta", async () => {
+    const resp = makeSseResponse([
+      'data: {"choices":[{"index":0,"finish_reason":"stop"}]}',
+    ]);
+    const lines = await collectLines(filterChatStream(resp));
+    expect(lines).toContain('data: {"choices":[{"index":0,"finish_reason":"stop"}]}');
+  });
+
+  it("handles choice without delta in hasContent", async () => {
+    const resp = makeSseResponse([
+      'data: {"choices":[{"delta":{"reasoning_content":"r"}},{"index":1}]}',
+    ]);
+    const lines = await collectLines(filterChatStream(resp));
+    const dataLines = lines.filter((l) => l.startsWith("data: {") && !l.includes("[DONE]"));
+    expect(dataLines).toHaveLength(0);
   });
 });

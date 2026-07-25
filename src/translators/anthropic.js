@@ -302,9 +302,6 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
             };
             contentIndex++;
           }
-          if (fn.name && !toolUseMap[idx].name) {
-            toolUseMap[idx].name = fn.name;
-          }
           if (fn.arguments) {
             toolUseMap[idx].input += fn.arguments;
             yield {

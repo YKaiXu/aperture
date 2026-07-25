@@ -1355,3 +1355,153 @@ describe("translateAnthropicStream", () => {
     expect(delta.data.usage.input_tokens).toBe(15);
   });
 });
+
+// =====================================================================
+// Comprehensively cover ALL remaining translator branches
+// (|| fallbacks, null checks, default cases)
+// =====================================================================
+
+describe("anthropic.js branch coverage — all || fallbacks", () => {
+  it("translateAnthropicToChat covers all fallback branches", () => {
+    const body = {
+      model: "claude-sonnet-4",
+      system: true, // not string, not array -> triggers empty-string fallback
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text" }, // text is undefined -> block.text || ""
+            { type: "image", source: { data: "base64data" } }, // no media_type -> "image/png"
+            { type: "tool_result", content: [{ type: "text", text: "result" }] },
+          ],
+        },
+        {
+          role: "assistant",
+          content: [
+            { type: "text" }, // text is undefined -> block.text || ""
+            { type: "tool_use", id: "", name: "", input: null }, // id/name/input fallbacks
+          ],
+        },
+        { role: "tool_result", content: null }, // null content -> || ""
+        { role: "tool", content: "tool output" },
+      ],
+      tools: [
+        { type: "custom", name: "my_tool", description: "A tool" },
+        { type: "function", function: { name: "fn_tool", description: "Fn tool" } },
+        { name: "simple_tool", description: "Simple" },
+      ],
+      tool_choice: { type: "any" },
+      max_tokens: 500,
+      temperature: 0.7,
+      top_p: 0.9,
+      stop_sequences: ["\n"],
+      thinking: { type: "enabled", budget_tokens: 4096 },
+      metadata: { user_id: "user_123" },
+    };
+
+    const result = translateAnthropicToChat(body, {});
+    expect(result.messages.length).toBeGreaterThanOrEqual(4);
+    expect(result.tools).toBeDefined();
+    expect(result.tools.length).toBe(3);
+    expect(result.tool_choice).toBe("required");
+    expect(result.thinking).toBeDefined();
+    expect(result.thinking.type).toBe("enabled");
+    expect(result.user_id).toBe("user_123");
+    expect(result.max_tokens).toBeGreaterThanOrEqual(1024);
+    expect(result.stop).toEqual(["\n"]);
+  });
+
+  it("translateAnthropicToChat covers missing params default values", () => {
+    const result = translateAnthropicToChat({}, {});
+    expect(result.messages).toEqual([]);
+    expect(result.stream).toBe(true);
+    expect(result.max_tokens).toBe(8192);
+  });
+
+  it("translateAnthropicJson covers null message and null usage", async () => {
+    const upstream = new Response(JSON.stringify({
+      choices: [{ finish_reason: "length", message: null }],
+      usage: null,
+    }), { headers: { "Content-Type": "application/json" } });
+
+    const result = await translateAnthropicJson(upstream, "req_null", "test-model");
+    expect(result.id).toBe("req_null");
+    expect(result.stop_reason).toBe("max_tokens");
+    expect(result.usage.input_tokens).toBe(0);
+  });
+
+  it("translateAnthropicJson covers tool_calls and null arguments", async () => {
+    const upstream = new Response(JSON.stringify({
+      choices: [{
+        finish_reason: "stop",
+        message: {
+          content: "Let me search",
+          tool_calls: [
+            { id: "tc_1", type: "function", function: { name: "search", arguments: null } },
+          ],
+        },
+      }],
+      usage: { prompt_tokens: 5, completion_tokens: 10 },
+    }), { headers: { "Content-Type": "application/json" } });
+
+    const result = await translateAnthropicJson(upstream, "req_tc", "test");
+    expect(result.content).toHaveLength(2);
+    expect(result.content[1].type).toBe("tool_use");
+    expect(result.content[1].input).toEqual({});
+  });
+
+  it("translateAnthropicStream covers tool_use without id", async () => {
+    const resp = makeSseResponse([
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n',
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"no_id_tool"}}]}}]}\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+      'data: [DONE]\n',
+    ]);
+    const events = await collectEvents(translateAnthropicStream(resp, "req_no_id", "test-model"));
+    const toolStarts = events.filter(e => e.event === "content_block_start" && e.data.content_block?.type === "tool_use");
+    expect(toolStarts.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("translateAnthropicStream covers finish_reason close of tool_use blocks", async () => {
+    const resp = makeSseResponse([
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"final_tool","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}\n',
+      'data: {"choices":[{"delta":{}}]}\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n',
+      'data: [DONE]\n',
+    ]);
+    const events = await collectEvents(translateAnthropicStream(resp, "req_final", "test-model"));
+    const stops = events.filter(e => e.event === "content_block_stop");
+    expect(stops.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it("translateAnthropicJson covers null/undefined usage (lines 404-405)", async () => {
+    const upstream = new Response(JSON.stringify({
+      choices: [{ finish_reason: "stop", message: { content: "OK" } }],
+      // No usage field at all
+    }), { headers: { "Content-Type": "application/json" } });
+    const result = await translateAnthropicJson(upstream, "req_no_usage", "test");
+    expect(result.usage.input_tokens).toBe(0);
+    expect(result.usage.output_tokens).toBe(0);
+  });
+
+  it("translateAnthropicToChat handles tool without description (line 424)", () => {
+    const result = translateAnthropicToChat({
+      model: "claude-sonnet-4",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ name: "no_desc_tool" }],
+    }, {});
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools[0].function.name).toBe("no_desc_tool");
+  });
+
+  it("translateAnthropicStream yields message_stop for unknown finish_reason (line 437)", async () => {
+    const resp = makeSseResponse([
+      'data: {"choices":[{"delta":{"content":"done"},"finish_reason":"other_reason"}]}\n',
+      'data: [DONE]\n',
+    ]);
+    const events = await collectEvents(translateAnthropicStream(resp, "req_other", "test"));
+    const delta = events.find(e => e.event === "message_delta");
+    expect(delta).toBeDefined();
+    expect(delta.data.delta.stop_reason).toBe("end_turn");
+  });
+});

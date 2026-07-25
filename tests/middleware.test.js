@@ -196,6 +196,32 @@ describe("rate-limiter.js - createRateLimiter()", () => {
   });
 });
 
+// ─── Rate Limiter TTL Pruning ──────────────────────────
+describe("rate-limiter TTL pruning", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(1_000_000);
+    vi.spyOn(Math, "random").mockReturnValue(0);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("prunes stale entries when size exceeds threshold and random triggers", () => {
+    const limiter = createRateLimiter(50, 1);
+    // At time 0, check three different keys
+    expect(limiter.check("key-a").allowed).toBe(true);
+    expect(limiter.check("key-b").allowed).toBe(true);
+    expect(limiter.check("key-c").allowed).toBe(true);
+    // Advance past the 50ms window
+    vi.advanceTimersByTime(100);
+    // hits.size=3 > maxRequests*2=2 && random(0)<0.02 → pruning deletes stale entries
+    expect(limiter.check("key-d").allowed).toBe(true);
+  });
+});
+
 // ─── Logger ─────────────────────────────────────────────
 describe("logger.js - createLogger()", () => {
   beforeEach(() => {

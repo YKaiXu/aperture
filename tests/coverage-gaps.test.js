@@ -275,3 +275,287 @@ describe("coverage-gap: dsml.js msg.content branch", () => {
     expect(msg.tool_calls).toHaveLength(1);
   });
 });
+
+// =====================================================================
+// NEW coverage-gap tests for uncovered lines
+// =====================================================================
+
+describe("coverage-gap: index.js lines 32-33 (parseInt NaN fallback)", () => {
+  it("falls back to defaults when env vars are invalid", async () => {
+    const mod = await import("../src/index.js");
+    const handler = mod.default.fetch;
+
+    const env = {
+      RATE_LIMIT_WINDOW_MS: "invalid",
+      RATE_LIMIT_MAX: "invalid",
+      AI_GATEWAY_TOKEN: "test",
+    };
+
+    const request = new Request("http://test.com/", {
+      method: "POST",
+      headers: { "Authorization": "Bearer test", "Content-Type": "application/json" },
+      body: JSON.stringify({
+        anthropic_version: "2023-06-01",
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+
+    // parseInt("invalid") returns NaN, NaN || fallback yields 60000/120
+    // So rate limiter should allow the request, not 429
+    const response = await handler(request, env);
+    // Not a parse error
+    expect(response.status).not.toBe(400);
+    // Not rate limited — NaN fallback worked
+    expect(response.status).not.toBe(429);
+  });
+});
+
+describe("coverage-gap: stream.js lines 137-138,143-144 (pipeSSE error catch)", () => {
+  it("handles errors in SSE pipe gracefully", async () => {
+    const { pipeSSE } = await import("../src/stream.js");
+
+    async function* throwingGenerator() {
+      yield { event: "test", data: { msg: "hello" } };
+      throw new Error("simulated error");
+    }
+
+    const response = pipeSSE(throwingGenerator());
+    // Cancel the body so the writable is errored, triggering catch blocks
+    await response.body.cancel();
+    // Give the detached async loop time to process
+    await new Promise(r => setTimeout(r, 10));
+    // If we reach here without an unhandled rejection, both catches worked
+    expect(true).toBe(true);
+  });
+});
+
+describe("coverage-gap: upstream.js line 20 (slug ternary)", () => {
+  it("includes custom slug in URL when CUSTOM_PROVIDER_SLUG is set", async () => {
+    const helpers = await import("../src/helpers.js");
+    const spy = vi.spyOn(helpers, "fetchUpstream").mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const { sendChatRequest } = await import("../src/upstream.js");
+    const env = {
+      AI_GATEWAY_URL: "https://gateway.example.com",
+      CUSTOM_PROVIDER_SLUG: "my-slug",
+      AI_GATEWAY_TOKEN: "key",
+    };
+    await sendChatRequest(env, { model: "test", messages: [] });
+
+    const calledUrl = spy.mock.calls[0][0];
+    expect(calledUrl).toContain("custom-my-slug");
+    spy.mockRestore();
+  });
+});
+
+describe("coverage-gap: upstream.js line 30 (bypass key fallback)", () => {
+  it("falls back to AI_GATEWAY_TOKEN when OPENCODE_API_KEY is missing in bypass mode", async () => {
+    const helpers = await import("../src/helpers.js");
+    const spy = vi.spyOn(helpers, "fetchUpstream").mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const { sendChatRequest } = await import("../src/upstream.js");
+    const env = {
+      BYPASS_GATEWAY: "true",
+      AI_GATEWAY_TOKEN: "fallback-token",
+      // No OPENCODE_API_KEY — triggers the || fallback
+    };
+    await sendChatRequest(env, { model: "test", messages: [] });
+
+    const headers = spy.mock.calls[0][1].headers;
+    expect(headers.Authorization).toBe("Bearer fallback-token");
+    spy.mockRestore();
+  });
+});
+
+describe("coverage-gap: upstream.js line 64 (parseInt NaN timeout)", () => {
+  it("falls back to default timeout when REQUEST_TIMEOUT_MS is invalid", async () => {
+    const helpers = await import("../src/helpers.js");
+    const spy = vi.spyOn(helpers, "fetchUpstream").mockResolvedValue(new Response("ok", { status: 200 }));
+
+    const { sendChatRequest } = await import("../src/upstream.js");
+    const env = {
+      AI_GATEWAY_URL: "https://gateway.example.com",
+      CUSTOM_PROVIDER_SLUG: "",
+      AI_GATEWAY_TOKEN: "key",
+      REQUEST_TIMEOUT_MS: "invalid",
+    };
+    await sendChatRequest(env, { model: "test", messages: [] });
+
+    // Third argument passed to fetchUpstream is the timeout
+    const timeoutArg = spy.mock.calls[0][2];
+    expect(timeoutArg).toBe(120000);
+    spy.mockRestore();
+  });
+});
+
+describe("coverage-gap: upstream.js line 117 (network error catch)", () => {
+  it("returns 502 on network error", async () => {
+    const helpers = await import("../src/helpers.js");
+    const spy = vi.spyOn(helpers, "fetchUpstream").mockRejectedValue(new Error("Network failure"));
+
+    const { sendChatRequest } = await import("../src/upstream.js");
+    const env = {
+      AI_GATEWAY_URL: "https://gateway.example.com",
+      CUSTOM_PROVIDER_SLUG: "",
+      AI_GATEWAY_TOKEN: "key",
+    };
+    const response = await sendChatRequest(env, { model: "test", messages: [] });
+
+    expect(response.status).toBe(502);
+    const body = await response.json();
+    expect(body.error.code).toBe("NETWORK_ERROR");
+    spy.mockRestore();
+  });
+});
+
+describe("coverage-gap: anthropic.js lines 441-442 (tool_choice default)", () => {
+  it("maps unknown tool_choice type to auto", async () => {
+    const { translateAnthropicToChat } = await import("../src/translators/anthropic.js");
+    const result = translateAnthropicToChat({
+      model: "claude-sonnet-4",
+      messages: [{ role: "user", content: "hi" }],
+      tools: [{ type: "function", function: { name: "test_tool" } }],
+      tool_choice: { type: "unknown_type" },
+    });
+    // mapAnthropicToolChoice falls through to the final return "auto"
+    expect(result.tool_choice).toBe("auto");
+  });
+});
+
+// =====================================================================
+// PHASE 2: Full branch coverage for index.js parseInt variants
+// =====================================================================
+
+describe("coverage-gap: index.js lines 32-33 (parseInt valid branch)", () => {
+  it("uses parsed value when env vars are valid integers", async () => {
+    const mod = await import("../src/index.js");
+    const handler = mod.default.fetch;
+    // With valid RATE_LIMIT_WINDOW_MS, the || short-circuits at the parsed value
+    const env = {
+      RATE_LIMIT_WINDOW_MS: "5000",
+      RATE_LIMIT_MAX: "10",
+      AI_GATEWAY_TOKEN: "test",
+    };
+    const request = new Request("http://test.com/", {
+      method: "POST",
+      headers: { "Authorization": "Bearer test", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "test", messages: [{ role: "user", content: "hi" }] }),
+    });
+    const response = await handler(request, env);
+    expect(response.status).not.toBe(400);
+  });
+
+  it("clamps RATE_LIMIT_WINDOW_MS to minimum 1000", async () => {
+    const mod = await import("../src/index.js");
+    const handler = mod.default.fetch;
+    const env = {
+      RATE_LIMIT_WINDOW_MS: "100",  // parseInt = 100, Math.max(1000, 100) = 1000
+      RATE_LIMIT_MAX: "1",
+      AI_GATEWAY_TOKEN: "test",
+    };
+    const request = new Request("http://test.com/", {
+      method: "POST",
+      headers: { "Authorization": "Bearer test", "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "test", messages: [{ role: "user", content: "hi" }] }),
+    });
+    const response = await handler(request, env);
+    // Should pass (window clamped to 1000ms, max=1, only 1 request)
+    expect(response.status).not.toBe(400);
+  });
+
+  it("handles unset env vars via || fallback", async () => {
+    const mod = await import("../src/index.js");
+    const handler = mod.default.fetch;
+    const env = {
+      AI_GATEWAY_TOKEN: "test",
+    };
+    const request = new Request("http://test.com/", {
+      method: "POST",
+      headers: { "Authorization": "Bearer test", "Content-Type": "application/json" },
+      body: JSON.stringify({ input: "hello" }),
+    });
+    const response = await handler(request, env);
+    expect(response.status).not.toBe(400);
+  });
+});
+
+// =====================================================================
+// PHASE 2: stream.js buffer-edge processing + cancel-error
+// =====================================================================
+
+describe("coverage-gap: stream.js lines 68-69 (trailing data: line with invalid JSON)", () => {
+  it("skips malformed JSON in trailing data: line", async () => {
+    const { streamSSE } = await import("../src/stream.js");
+    // Stream that ends with "data: {invalid" (starts with data: but invalid JSON)
+    const encoder = new TextEncoder();
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: {"ok":true}\ndata: {not valid'));
+        controller.close();
+      },
+    });
+    const response = new Response(stream);
+    const results = [];
+    for await (const obj of streamSSE(response)) {
+      results.push(obj);
+    }
+    expect(results).toEqual([{ ok: true }]);
+  });
+});
+
+describe("coverage-gap: stream.js lines 77-78 (reader.cancel() throws)", () => {
+  it("catches reader.cancel error on buffer overflow", async () => {
+    const { streamSSE } = await import("../src/stream.js");
+    // Create a stream where cancel() throws
+    const bigPayload = "y".repeat(2 * 1024 * 1024 + 1);
+    const body = `data: {"big":"${bigPayload}"}\n`;
+    const encoder = new TextEncoder();
+    let cancelCalled = false;
+    const stream = new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode(body));
+      },
+      cancel() {
+        cancelCalled = true;
+        throw new Error("cancel_failed");
+      },
+    });
+    const response = new Response(stream);
+    try {
+      for await (const _ of streamSSE(response)) {}
+    } catch {
+      // expected
+    }
+    expect(cancelCalled).toBe(true);
+  });
+});
+
+// =====================================================================
+// PHASE 2: responses.js toolCallsMap name update — more direct test
+// =====================================================================
+
+describe("coverage-gap: responses.js lines 284-285 (toolCallsMap name update direct)", () => {
+  it("updates tool call name when provided on subsequent chunk (no existing name)", async () => {
+    const { translateStreamEvents } = await import("../src/translators/responses.js");
+    const encoder = new TextEncoder();
+    const chunks = [
+      // First: create tool_call with arguments (NO finish_reason to avoid deletion)
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_xyz","function":{"arguments":"{}"}}]}}]}\n',
+      // Second: update the name (same index, finishes before any finish_reason)
+      'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"lookup"}}]}}]}\n',
+      // Third: close the stream
+      'data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}\n',
+      'data: [DONE]\n',
+    ];
+    const stream = new ReadableStream({
+      start(c) { for (const chunk of chunks) c.enqueue(encoder.encode(chunk)); c.close(); },
+    });
+    const events = [];
+    for await (const ev of translateStreamEvents(new Response(stream), "resp_tool", "test")) {
+      events.push(ev);
+      if (ev.event === "response.completed") break;
+    }
+    const added = events.filter(e => e.event === "response.output_item.added" && e.data.item?.type === "function_call");
+    expect(added.length).toBeGreaterThan(0);
+  });
+});

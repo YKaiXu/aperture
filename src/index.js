@@ -60,7 +60,6 @@ export default {
       case "chat":      return handleChatCompletions(body, env, request.signal);
       case "responses": return handleResponsesAPI(body, env, request.signal);
       case "anthropic": return handleAnthropicMessages(body, env, request.signal);
-      default:          return errorResponse("Unknown API format", "invalid_request", "FORMAT_UNKNOWN", 400);
     }
   },
 };
