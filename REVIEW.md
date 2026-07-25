@@ -9,6 +9,10 @@ total: 30
 
 # Code Review: Aperture 🔭
 
+> **⚠️ 注意：此审查基于旧架构（5 个源文件）。项目已重构为 14 个模块（见 `docs/superpowers/specs/`）。**
+> **所有 Critical/Medium 问题已在 commit `2252d54`、`62301c3`、`f8822d5` 中修复。**
+> **当前状态：356 测试，99% 覆盖率，100% 函数覆盖。**
+
 ## Summary
 
 Aperture is a Cloudflare Worker that translates OpenAI Responses API and Anthropic Messages API requests into OpenAI Chat Completions for upstream consumption. The codebase is lean and purpose-built, but contains several correctness, security, and protocol compliance defects that affect production reliability. Critical issues include a broken Responses API string-input handler, upstream error message leakage to clients, an unbounded in-memory rate limiter, hardcoded model names across all translated responses, dropped Anthropic assistant tool-use blocks, and ReDoS-vulnerable regex in the DSML parser. Streaming error paths are universally silent (no telemetry), and several protocol translation edge cases will cause client SDKs to misbehave or hang.

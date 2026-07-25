@@ -9,6 +9,7 @@ wrangler.toml
 .claude/
 .omo/
 coverage/
+ses_*/
 CODEBUDDY.md
 vitest.config.mjs
 vitest.config.js

@@ -9,11 +9,23 @@
 ```
 客户端 ──→ Aperture Worker ──→ AI Gateway ──→ 上游 API (opencode.ai)
               │
-              ├─ src/index.js      路由、认证、流式管道、DSML 适配
-              ├─ src/upstream.js   上游 API 客户端、URL 构建
-              ├─ src/responses.js  OpenAI Responses API → Chat Completions
-              ├─ src/anthropic.js  Anthropic Messages API → Chat Completions
-              └─ src/utils.js      工具函数、认证、CORS、SSE、日志、限流
+              ├─ src/index.js              入口 (~64 行) — CORS → 限流 → 认证 → 路由
+              ├─ src/config.js             配置与模型映射
+              ├─ src/helpers.js            通用工具（底部依赖层）
+              ├─ src/stream.js             SSE 流处理（streamSSE + pipeSSE）
+              ├─ src/upstream.js           上游 API 客户端（AbortSignal 合并）
+              ├─ src/middleware/
+              │   ├─ auth.js               认证（Bearer + x-api-key）
+              │   ├─ rate-limiter.js        滑动窗口限流
+              │   └─ logger.js             结构化日志
+              ├─ src/handlers/
+              │   ├─ chat.js               Chat 透传 + filterChatStream
+              │   ├─ responses.js           Responses API 编排
+              │   └─ anthropic.js           Anthropic API 编排
+              └─ src/translators/
+                  ├─ responses.js           Responses ↔ Chat（纯函数）
+                  ├─ anthropic.js           Anthropic ↔ Chat（纯函数）
+                  └─ dsml.js                DeepSeek DSML 适配
 ```
 
 **核心原则：** Worker 只做协议翻译，不做策略决策。限速、缓存、模型映射交给 AI Gateway。
@@ -29,8 +41,10 @@
 
 ### 2.2 模块规范
 - 所有源文件使用 `.js` 扩展名，ES Module `import`/`export`
-- 工具函数放 `utils.js`，翻译逻辑按协议分文件
-- 不要在 `index.js` 中写超过 300 行的函数——拆分到独立模块
+- 分层单向依赖：`helpers → middleware/stream → upstream → translators → handlers → index`
+- 每个文件 ≤150 行，单一职责
+- Translators 是纯函数，不依赖 Request/Response/env
+- Handlers 只做编排（翻译请求 → 调上游 → 翻译响应 → 返回）
 
 ### 2.3 命名约定
 - 异步生成器用 `translate*Stream` 命名（如 `translateStreamEvents`）
@@ -128,8 +142,10 @@ return errorResponse("Upstream request failed", "upstream_error", "UPSTREAM", st
 
 ### 6.2 测试框架
 - 使用 vitest（已声明为 devDependency）
-- Workers API 通过 `tests/setup.js` mock
-- 纯翻译函数无需 Workers 运行时即可测试
+- 15 个测试文件，356+ 测试，99%+ 行覆盖率，100% 函数覆盖率
+- 包含真实 E2E 测试（`tests/e2e.test.js`，启动真实 HTTP 上游服务器）
+- 纯翻译函数无需 mock 即可测试
+- 提交前运行 `npm test` 确认全部通过
 
 ---
 
@@ -146,8 +162,8 @@ return errorResponse("Upstream request failed", "upstream_error", "UPSTREAM", st
 3. 流式相关修改后检查 SSE 格式正确性（`\n\n` 结尾）
 
 ### 7.3 修改代码后
-1. 验证 `npm test` 通过（如无测试则至少手动验证）
-2. 运行 `grep -rn "deepseek-v4-flash" src/` 确认无残留硬编码
+1. 验证 `npm test` 通过（356+ 测试全部通过）
+2. 运行 `grep -rn "deepseek-v4-flash" src/ --include='*.js'` 确认除 config.js 外无残留硬编码
 3. 推送到 GitHub 前确认 git remote 正确
 
 ---

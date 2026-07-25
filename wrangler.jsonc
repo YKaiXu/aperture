@@ -23,6 +23,6 @@
     "REQUEST_TIMEOUT_MS": "120000",
     "RATE_LIMIT_MAX": "120",
     "RATE_LIMIT_WINDOW_MS": "60000",
-    "BYPASS_GATEWAY": "true"
+    "BYPASS_GATEWAY": "false"
   }
 }

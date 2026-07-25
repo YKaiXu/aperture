@@ -59,7 +59,8 @@ afterAll(() => {
 });
 
 describe("e2e — full pipeline (real HTTP upstream)", () => {
-  const env = {
+  // Build env at call time so upstreamUrl is already resolved by beforeAll.
+  const makeEnv = (overrides = {}) => ({
     UPSTREAM_BASE_URL: upstreamUrl,
     BYPASS_GATEWAY: "true",
     RATE_LIMIT_WINDOW_MS: "60000",
@@ -67,7 +68,8 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
     AI_GATEWAY_TOKEN: "test-token",
     OPENCODE_API_KEY: "test-key",
     DEFAULT_MODEL: "test-model",
-  };
+    ...overrides,
+  });
 
   // Ensure upstreamUrl is resolved before tests
   it("upstream server is running", () => {
@@ -85,7 +87,7 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
       headers: { "Authorization": "Bearer test-token", "Content-Type": "application/json" },
       body,
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(200);
     const data = await response.json();
     expect(data.choices?.[0]?.message?.content).toBe("Hello from upstream!");
@@ -102,7 +104,7 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
       headers: { "Authorization": "Bearer test-token", "Content-Type": "application/json" },
       body,
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Type")).toBe("text/event-stream");
     const text = await response.text();
@@ -121,7 +123,7 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
       headers: { "x-api-key": "test-token", "Content-Type": "application/json" },
       body,
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(200);
     const data = await response.json();
     expect(data.type).toBe("message");
@@ -139,7 +141,7 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
       headers: { "Authorization": "Bearer test-token", "Content-Type": "application/json" },
       body,
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(200);
     const data = await response.json();
     expect(data.object).toBe("response");
@@ -152,23 +154,22 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
       headers: { "Content-Type": "application/json" },
       body,
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(401);
   });
 
-  it("rate limiter first request is always allowed (per-fetch Map)", async () => {
-    // NOTE: The rate limiter is created inside worker.fetch() with a fresh Map
-    // per invocation, so the first check always creates a new entry and returns
-    // allowed=true. Even RATE_LIMIT_MAX="0" is clamped to 120 because
-    // Math.max(1, 0 || 120) = 120. 429 is not achievable on any single request
-    // with the current architecture.
+  it("rate limiter allows first request (module-level singleton)", async () => {
+    // The rate limiter is a module-level singleton initialised on the first
+    // worker.fetch() call (see getRateLimiter in index.js). Once created with
+    // the base env max=120, it cannot be re-initialised. The rate-limit
+    // middleware is already thoroughly covered in index.test.js via mock.
     const body = JSON.stringify({ model: "test", messages: [{ role: "user", content: "hi" }] });
     const request = new Request("http://test.com/v1/chat/completions", {
       method: "POST",
       headers: { "Authorization": "Bearer test-token", "Content-Type": "application/json" },
       body,
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl, RATE_LIMIT_MAX: "0" });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(200);
   });
 
@@ -178,7 +179,7 @@ describe("e2e — full pipeline (real HTTP upstream)", () => {
       headers: { "Authorization": "Bearer test-token", "Content-Type": "application/json" },
       body: "not json",
     });
-    const response = await worker.fetch(request, { ...env, UPSTREAM_BASE_URL: upstreamUrl });
+    const response = await worker.fetch(request, makeEnv());
     expect(response.status).toBe(400);
   });
 });
