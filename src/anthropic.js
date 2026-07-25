@@ -189,7 +189,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
 
   let contentIndex = 0;
   let textBlockIndex = -1;        // -1 = no text block currently open
-  let thinkingAccumulator = "";        // Accumulates reasoning content (not emitted)
+  
   const toolUseMap = {};
   let lastFinishReason = null;
   const streamUsage = { input_tokens: 0, output_tokens: 0 };
@@ -208,29 +208,12 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
       const finishReason = choice.finish_reason;
       if (finishReason) lastFinishReason = finishReason;
 
-      // Reasoning content: accumulate silently, don't emit as thinking blocks.
-      // We open a text block to ensure proper block sequencing but emit empty
-      // deltas — the model's actual text/tool output is what matters.
+      // Reasoning content: silently ignore. Do NOT emit any SSE events —
+      // emitting empty text deltas for each reasoning chunk causes Claude CLI
+      // to hang (it receives 50-200 empty text deltas before any real content).
+      // The model's actual text or tool_call output will create its own block.
       if (reasoning) {
-        if (textBlockIndex === -1) {
-          textBlockIndex = contentIndex;
-          yield {
-            event: "content_block_start",
-            data: {
-              type: "content_block_start",
-              index: textBlockIndex,
-              content_block: { type: "text", text: "" },
-            },
-          };
-        }
-        yield {
-          event: "content_block_delta",
-          data: {
-            type: "content_block_delta",
-            index: textBlockIndex,
-            delta: { type: "text_delta", text: "" },
-          },
-        };
+        // skip — reasoning is not a standard Anthropic content block type
       }
 
       // Text content: open the text block ONCE, accumulate deltas, close ONCE.
