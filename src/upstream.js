@@ -1,60 +1,84 @@
 // ─── Upstream API Client ─────────────────────────────────
-// Minimal fetch wrapper. Sends translated Chat Completions payload
-// to the configured upstream or AI Gateway and returns raw Response.
-// Zero policy logic — no fallback, no retry, no custom timeout.
+// Routes through Cloudflare AI Gateway for caching + analytics.
+// Falls back to direct upstream on Gateway failure.
 
-const DEFAULT_UPSTREAM_URL = "https://opencode.ai/zen/go/v1";
+import { fetchUpstream } from "./utils.js";
 
 function buildUpstreamUrl(env) {
+  // Direct mode: skip AI Gateway entirely
+  const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
+  if (bypass) {
+    const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
+    return `${baseUrl}/chat/completions`;
+  }
+
+  // AI Gateway route
   const gwUrl = (env.AI_GATEWAY_URL || "").trim();
   if (gwUrl) {
     const base = gwUrl.replace(/\/+$/, "");
     const slug = env.CUSTOM_PROVIDER_SLUG || "";
-    return slug
-      ? `${base}/custom-${slug}/v1/chat/completions`
-      : `${base}/chat/completions`;
+    return slug ? `${base}/custom-${slug}/v1/chat/completions` : `${base}/chat/completions`;
   }
-  const baseUrl = env.UPSTREAM_BASE_URL || DEFAULT_UPSTREAM_URL;
+  // Direct route (fallback)
+  const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
   return `${baseUrl}/chat/completions`;
 }
 
-/**
- * Send a Chat Completions request to the upstream.
- * Forwards the client's Authorization header to the upstream/Gateway.
- * No Worker-side secrets required — auth is handled by the AI Gateway.
- *
- * @param {object} env - Workers environment bindings
- * @param {object} chatBody - Translated Chat Completions payload
- * @param {object} [log] - Optional logger (from createLogger)
- * @returns {Promise<Response>}
- */
-export async function sendChatRequest(env, chatBody, log = { info(){}, warn(){}, error(){} }) {
-  const url = buildUpstreamUrl(env);
-  const apiKey = env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
-  const headers = { "Content-Type": "application/json" };
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+function chooseApiKey(env) {
+  const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
+  if (bypass) {
+    return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
+  }
 
-  const startTime = Date.now();
-  log.info("upstream.send", { url, model: chatBody.model, hasAuth: !!apiKey });
-
-  const response = await fetch(url, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(chatBody),
-  });
-
-  log.info("upstream.done", {
-    status: response.status,
-    ok: response.ok,
-    durationMs: Date.now() - startTime,
-  });
-
-  return response;
+  // In Gateway mode, use Gateway token (Gateway stores upstream API key)
+  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
+  if (gwUrl) {
+    return env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
+  }
+  return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 }
 
-/**
- * Extract usage statistics from an upstream completion response.
- */
+export async function sendChatRequest(env, chatBody) {
+  const url = buildUpstreamUrl(env);
+  const apiKey = chooseApiKey(env);
+  const timeout = parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10);
+
+  const response = await fetchUpstream(
+    url,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify(chatBody),
+    },
+    timeout
+  );
+
+  if (response.ok || response.status !== 400) return response;
+
+  // Gateway 400 → fallback directly to upstream
+  const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
+  if (bypass || !(env.AI_GATEWAY_URL || "").trim()) return response; // already direct
+
+  const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
+  const fallbackKey = env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
+
+  return fetchUpstream(
+    fallbackUrl,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${fallbackKey}`,
+      },
+      body: JSON.stringify(chatBody),
+    },
+    timeout
+  );
+}
+
 export function extractUsage(upstreamData) {
   if (!upstreamData?.usage) return null;
   const u = upstreamData.usage;
@@ -64,3 +88,8 @@ export function extractUsage(upstreamData) {
     total_tokens: u.total_tokens ?? 0,
   };
 }
+
+export function getFinishReason(choice) {
+  return choice?.finish_reason || null;
+}
+

@@ -35,17 +35,24 @@ export function resolveDefaultModel(env) {
 export function extractText(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
-    return content
-      .map((part) => {
-        if (typeof part === "string") return part;
-        // Support both Anthropic and OpenAI content block styles
-        if (part.type === "text") return part.text;
-        if (part.text) return part.text;
-        // Fallback: any key ending with _text
-        const textKey = Object.keys(part).find((k) => k.endsWith("_text") || k === "text");
-        return textKey ? part[textKey] : "";
-      })
-      .join("");
+    let result = "";
+    for (let i = 0; i < content.length; i++) {
+      const part = content[i];
+      if (typeof part === "string") {
+        result += part;
+      } else if (part?.type === "text") {
+        result += part.text || "";
+      } else if (part?.text) {
+        result += part.text;
+      } else if (part?.type === "thinking") {
+        result += part.thinking || "";
+      } else if (part?.type === "redacted_thinking") {
+        result += "[Redacted thinking]";
+      }
+      // Skip the fallback Object.keys().find() entirely
+      // All known content block types (text, thinking, redacted_thinking) are handled above
+    }
+    return result;
   }
   return "";
 }

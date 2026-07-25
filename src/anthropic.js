@@ -1,7 +1,7 @@
 // ─── Anthropic Messages API → OpenCode Chat Completions ───
 
-import { uid, now, extractText, resolveDefaultModel, parseChatSSE, MIN_MAX_TOKENS } from "./utils.js";
-import { extractUsage } from "./upstream.js";
+import { uid, now, extractText, streamSSE } from "./utils.js";
+import { sendChatRequest, extractUsage, getFinishReason } from "./upstream.js";
 
 /**
  * Translate an Anthropic Messages API request body to OpenCode Chat Completions format.
@@ -57,8 +57,8 @@ export function translateAnthropicToChat(body) {
               });
             }
           } else if (block.type === "tool_result") {
-            // Convert tool result to user text (upstream Console Go
-            // doesn't support role: "tool" in multi-turn conversations).
+            // Compat mode: convert tool result to user text since the
+            // upstream API rejects role:"tool" messages.
             const out = typeof block.content === "string"
               ? block.content
               : extractText(block.content);
@@ -81,42 +81,15 @@ export function translateAnthropicToChat(body) {
 
     if (msg.role === "assistant") {
       const translated = translateAnthropicContent(msg.content);
-      const assistantMsg = { role: "assistant", content: translated.text };
-
-      // Convert tool_use blocks in assistant messages to tool_calls
-      // so the upstream Chat Completions API sees a complete tool call cycle.
-      if (Array.isArray(msg.content)) {
-        const toolCalls = [];
-        for (const block of msg.content) {
-          if (block.type === "tool_use") {
-            toolCalls.push({
-              id: block.id || `call_${uid("")}`,
-              type: "function",
-              function: {
-                name: block.name,
-                arguments:
-                  typeof block.input === "string"
-                    ? block.input
-                    : JSON.stringify(block.input || {}),
-              },
-            });
-          }
-        }
-        if (toolCalls.length > 0) {
-          assistantMsg.tool_calls = toolCalls;
-        }
-      }
-
-      messages.push(assistantMsg);
+      messages.push({ role: "assistant", content: translated.text });
       continue;
     }
 
     if (msg.role === "tool_result" || msg.role === "tool") {
-      // Convert tool results to user text (upstream Console Go
-      // doesn't support role: "tool" in multi-turn conversations).
-      const content = typeof msg.content === "string" 
-        ? msg.content 
-        : Array.isArray(msg.content) 
+      // Convert tool results to user text for upstream compatibility.
+      const content = typeof msg.content === "string"
+        ? msg.content
+        : Array.isArray(msg.content)
           ? msg.content.map((b) => extractText(b)).join("\n")
           : "";
       messages.push({ role: "user", content: content || "" });
@@ -128,21 +101,11 @@ export function translateAnthropicToChat(body) {
     messages.unshift({ role: "system", content: systemContent.trim() });
   }
 
-  // Upstream (Console Go) doesn't support tool_calls in conversation history.
-  // Since tool results have been converted to user text, we must also strip
-  // tool_calls from assistant messages to avoid 400 errors on multi-turn
-  // conversations that include tool interactions.
-  for (const m of messages) {
-    delete m.tool_calls;
-  }
-
   // Build chat request
-  // Note: stream defaults to false. The caller (handleAnthropicMessages)
-  // should set stream: true if the client requested SSE via Accept header.
   const chat = {
     model: translateModel(body.model),
     messages,
-    stream: body.stream === true,
+    stream: body.stream !== false,
   };
 
   // Copy parameters
@@ -159,7 +122,7 @@ export function translateAnthropicToChat(body) {
   if (body.max_tokens === undefined) chat.max_tokens = 8192;
   // Enforce a sensible minimum so reasoning models don't spend the whole budget
   // on chain-of-thought and leave the actual answer empty.
-  chat.max_tokens = Math.max(chat.max_tokens, MIN_MAX_TOKENS);
+  chat.max_tokens = Math.max(chat.max_tokens, 1024);
 
   // Tools → function calling
   if (body.tools && body.tools.length > 0) {
@@ -167,16 +130,13 @@ export function translateAnthropicToChat(body) {
     for (const t of body.tools) {
       if (t.type === "custom" || t.type === "function" || (!t.type && t.name)) {
         const fn = t.function || t;
-        // OpenAI Chat Completions uses `parameters`; Anthropic uses `input_schema`.
-        // Map Anthropic's `input_schema` to `parameters` and omit `input_schema`.
-        const schema = fn.parameters || t.parameters || fn.input_schema || t.input_schema;
-        if (!schema) continue;
         tools.push({
           type: "function",
           function: {
             name: fn.name || t.name,
             description: fn.description || t.description,
-            parameters: schema,
+            input_schema: fn.input_schema || t.input_schema,
+            parameters: fn.parameters || t.parameters || fn.input_schema || t.input_schema,
           },
         });
       }
@@ -208,9 +168,7 @@ export function translateAnthropicToChat(body) {
  * Since upstream returns Chat Completions format, we emit SSE events
  * that an Anthropic client can consume.
  */
-export async function* translateAnthropicStream(upstreamResponse, requestId) {
-  const model = resolveDefaultModel();
-
+export async function* translateAnthropicStream(upstreamResponse, requestId, model = "deepseek-v4-flash") {
   // Emit the start-of-stream event for Anthropic
   yield {
     event: "message_start",
@@ -236,7 +194,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
   let lastFinishReason = null;
   const streamUsage = { input_tokens: 0, output_tokens: 0 };
 
-  for await (const chunk of parseChatSSE(upstreamResponse)) {
+  for await (const chunk of streamSSE(upstreamResponse)) {
     // Track usage from chunks (some providers emit usage in the final chunk)
     if (chunk.usage) {
       streamUsage.input_tokens = chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0;
@@ -341,68 +299,40 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
           const fn = tc.function || {};
           const idx = tc.index;
           if (!toolUseMap[idx]) {
-            // Some providers (e.g. Console Go / OpenCode) never set
-            // function.name or id — the function name is embedded inside
-            // the arguments JSON. We buffer and defer content_block_start
-            // until we can extract the name from arguments.
             toolUseMap[idx] = {
-              blockIndex: -1,   // not yet assigned
-              id: tc.id || "",
-              name: fn.name || "",
+              blockIndex: contentIndex,
+              id: tc.id || uid("toolu"),
+              name: fn.name || `tool_${(tc.id || "").slice(0, 8) || "unknown"}`,
               input: "",
-              started: false,   // content_block_start not yet emitted
             };
+            yield {
+              event: "content_block_start",
+              data: {
+                type: "content_block_start",
+                index: toolUseMap[idx].blockIndex,
+                content_block: {
+                  type: "tool_use",
+                  id: toolUseMap[idx].id,
+                  name: toolUseMap[idx].name,
+                  input: {},
+                },
+              },
+            };
+            contentIndex++;
           }
-
+          if (fn.name && !toolUseMap[idx].name) {
+            toolUseMap[idx].name = fn.name;
+          }
           if (fn.arguments) {
             toolUseMap[idx].input += fn.arguments;
-
-            // If we haven't emitted content_block_start yet and now have
-            // enough data, try to extract the name from arguments JSON.
-            if (!toolUseMap[idx].started) {
-              // Extract id from arguments if not provided separately
-              if (!toolUseMap[idx].id) {
-                const idMatch = toolUseMap[idx].input.match(/"id"\s*:\s*"([^"]+)"/);
-                if (idMatch) toolUseMap[idx].id = idMatch[1];
-              }
-              // Extract name from arguments JSON (e.g. {"name":"web_search",...})
-              if (!toolUseMap[idx].name) {
-                const nameMatch = toolUseMap[idx].input.match(/"name"\s*:\s*"([^"]+)"/);
-                if (nameMatch) toolUseMap[idx].name = nameMatch[1];
-              }
-              // Only emit content_block_start once we have the name (or enough input)
-              if (toolUseMap[idx].name || toolUseMap[idx].input.length > 50) {
-                toolUseMap[idx].blockIndex = contentIndex;
-                toolUseMap[idx].id = toolUseMap[idx].id || uid("toolu");
-                toolUseMap[idx].started = true;
-                yield {
-                  event: "content_block_start",
-                  data: {
-                    type: "content_block_start",
-                    index: toolUseMap[idx].blockIndex,
-                    content_block: {
-                      type: "tool_use",
-                      id: toolUseMap[idx].id,
-                      name: toolUseMap[idx].name || toolUseMap[idx].id,
-                      input: {},
-                    },
-                  },
-                };
-                contentIndex++;
-              }
-            }
-
-            // Emit delta only after content_block_start has been sent
-            if (toolUseMap[idx].started) {
-              yield {
-                event: "content_block_delta",
-                data: {
-                  type: "content_block_delta",
-                  index: toolUseMap[idx].blockIndex,
-                  delta: { type: "input_json_delta", partial_json: fn.arguments },
-                },
-              };
-            }
+            yield {
+              event: "content_block_delta",
+              data: {
+                type: "content_block_delta",
+                index: toolUseMap[idx].blockIndex,
+                delta: { type: "input_json_delta", partial_json: fn.arguments },
+              },
+            };
           }
         }
       }
@@ -411,33 +341,6 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
       if (finishReason) {
         for (const key of Object.keys(toolUseMap)) {
           const tc = toolUseMap[key];
-          // If content_block_start was never emitted, force-emit it now
-          // with name extracted from arguments.
-          if (!tc.started) {
-            tc.id = tc.id || uid("toolu");
-            if (!tc.name && tc.input) {
-              try {
-                const parsed = JSON.parse(tc.input);
-                if (parsed.name) tc.name = parsed.name;
-              } catch {}
-            }
-            tc.blockIndex = contentIndex;
-            tc.started = true;
-            yield {
-              event: "content_block_start",
-              data: {
-                type: "content_block_start",
-                index: tc.blockIndex,
-                content_block: {
-                  type: "tool_use",
-                  id: tc.id,
-                  name: tc.name || tc.id,
-                  input: {},
-                },
-              },
-            };
-            contentIndex++;
-          }
           yield {
             event: "content_block_stop",
             data: { type: "content_block_stop", index: tc.blockIndex },
@@ -484,7 +387,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId) {
 /**
  * Translate a complete upstream Chat Completion response to Anthropic Messages JSON format.
  */
-export async function translateAnthropicJson(upstreamResponse, requestId) {
+export async function translateAnthropicJson(upstreamResponse, requestId, model = "deepseek-v4-flash") {
   const data = await upstreamResponse.json();
   const choice = data.choices?.[0];
   const message = choice?.message || {};
@@ -530,7 +433,7 @@ export async function translateAnthropicJson(upstreamResponse, requestId) {
     type: "message",
     role: "assistant",
     content,
-    model: resolveDefaultModel(),
+    model,
     stop_reason: stopReason,
     stop_sequence: null,
     usage: data.usage
@@ -544,8 +447,17 @@ export async function translateAnthropicJson(upstreamResponse, requestId) {
 
 // ─── Internal helpers ──────────────────────────────
 
-function translateModel(model) {
-  return resolveDefaultModel();
+function translateModel(model, env) {
+  if (!model) return env?.DEFAULT_MODEL || "deepseek-v4-flash";
+  // Map common Anthropic model names to our model
+  const modelMap = {
+    "claude-sonnet-4-20250514": env?.DEFAULT_MODEL || "deepseek-v4-flash",
+    "claude-sonnet-4": env?.DEFAULT_MODEL || "deepseek-v4-flash",
+    "claude-3-5-sonnet-latest": env?.DEFAULT_MODEL || "deepseek-v4-flash",
+    "claude-3-haiku": env?.DEFAULT_MODEL || "deepseek-v4-flash",
+    "claude-3-opus": env?.DEFAULT_MODEL || "deepseek-v4-flash",
+  };
+  return modelMap[model] || env?.DEFAULT_MODEL || "deepseek-v4-flash";
 }
 
 function mapFinishReason(fr) {
@@ -585,9 +497,10 @@ function translateAnthropicContent(content) {
           });
         }
       } else if (block.type === "tool_result") {
+        // Already handled at message level
         text += extractText(block.content) || "";
       } else if (block.type === "tool_use") {
-        // Handled at message level — converted to tool_calls on assistant message
+        // Already handled at message level
       } else if (block.type === "thinking") {
         text += `[Thinking: ${block.thinking || ""}]`;
       } else if (block.type === "redacted_thinking") {
@@ -598,5 +511,3 @@ function translateAnthropicContent(content) {
   }
   return { text: "", images: [] };
 }
-
-

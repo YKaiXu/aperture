@@ -1,7 +1,7 @@
 // ─── OpenAI Responses API → OpenCode Chat Completions ─────
 
-import { uid, now, extractText, resolveDefaultModel, parseChatSSE, MIN_MAX_TOKENS, DEFAULT_MAX_TOKENS } from "./utils.js";
-import { extractUsage } from "./upstream.js";
+import { uid, now, extractText, streamSSE } from "./utils.js";
+import { sendChatRequest, extractUsage } from "./upstream.js";
 
 /**
  * Translate an OpenAI Responses API request body to OpenCode Chat Completions format.
@@ -112,9 +112,9 @@ export function translateToChat(body) {
 
   // Build the chat request
   const chat = {
-    model: body.model || resolveDefaultModel(),
+    model: body.model || "deepseek-v4-flash",
     messages,
-    stream: body.stream === true,
+    stream: body.stream !== false,
   };
 
   // Copy over supported parameters
@@ -124,10 +124,10 @@ export function translateToChat(body) {
   }
 
   // Token limits
-  const maxTokens = body.max_output_tokens ?? body.max_tokens ?? DEFAULT_MAX_TOKENS;
+  const maxTokens = body.max_output_tokens ?? body.max_tokens ?? 16384;
   // Enforce a sensible minimum so reasoning models don't spend the whole budget
   // on chain-of-thought and leave the actual answer empty.
-  chat.max_tokens = Math.max(maxTokens, MIN_MAX_TOKENS);
+  chat.max_tokens = Math.max(maxTokens, 1024);
 
   // Tool/function definitions
   if (body.tools && body.tools.length > 0) {
@@ -184,13 +184,13 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
         id: respId,
         object: "response",
         created_at: now(),
-        model: resolveDefaultModel(),
+        model: "deepseek-v4-flash",
         output: [],
       },
     },
   };
 
-  for await (const chunk of parseChatSSE(upstreamResponse)) {
+  for await (const chunk of streamSSE(upstreamResponse)) {
     if (chunk.usage) usage = chunk.usage;
 
     for (const choice of chunk.choices || []) {
@@ -306,8 +306,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
           yield { event: "response.output_item.done", data: makeToolCallDone(outputIndex, tc) };
           outputIndex++;
         }
-        // Properly clear the object (toolCallsMap is an Object, not an Array)
-        Object.keys(toolCallsMap).forEach((k) => delete toolCallsMap[k]);
+        toolCallsMap.length = 0;
         toolOrder.length = 0;
       }
     }
@@ -336,7 +335,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
         id: respId,
         object: "response",
         created_at: now(),
-        model: resolveDefaultModel(),
+        model: "deepseek-v4-flash",
         output: [],
         usage: respUsage,
       },
@@ -386,7 +385,7 @@ export async function translateResponseJson(upstreamResponse, respId) {
     id: respId,
     object: "response",
     created_at: now(),
-    model: resolveDefaultModel(),
+    model: "deepseek-v4-flash",
     output,
     usage: data.usage
       ? {
