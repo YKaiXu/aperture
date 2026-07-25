@@ -223,3 +223,75 @@ export const pipeChatStream = createPipeStream(
 );
 
 
+
+
+/**
+ * Parse a SSE stream from a Response into parsed JSON objects.
+ * Yields each "data: {...}" line as a parsed object.
+ */
+export async function* streamSSE(response) {
+  if (!response?.body) return;
+  const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += value;
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data: ")) continue;
+      const payload = trimmed.slice(6).trim();
+      if (payload === "[DONE]") continue;
+      try {
+        yield JSON.parse(payload);
+      } catch { /* skip malformed */ }
+    }
+  }
+}
+
+/**
+ * Fetch with timeout. Aborts the request after `ms` milliseconds.
+ */
+export async function fetchUpstream(url, options, timeoutMs = 120000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    return response;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Create an in-memory rate limiter (sliding window).
+ */
+export function createRateLimiter(windowMs, maxRequests) {
+  const hits = new Map();
+  return {
+    check(key) {
+      const now = Date.now();
+      const record = hits.get(key);
+      if (!record || now - record.windowStart > windowMs) {
+        hits.set(key, { windowStart: now, count: 1 });
+        return { allowed: true, resetAt: now + windowMs };
+      }
+      if (record.count >= maxRequests) {
+        return { allowed: false, resetAt: record.windowStart + windowMs };
+      }
+      record.count++;
+      return { allowed: true, resetAt: record.windowStart + windowMs };
+    },
+  };
+}
+
+/**
+ * Create an AbortController with timeout.
+ */
+export function withTimeout(ms) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  return { controller, timer, signal: controller.signal };
+}
