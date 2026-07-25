@@ -14,6 +14,49 @@ function detectRoute(path, body) {
   return "responses";
 }
 
+/**
+ * Build the model list from environment configuration.
+ * Exposes aliases (MODEL_MAP keys) and the actual upstream models, plus
+ * Claude-compatible IDs so tools like Claude Code can find a usable model.
+ */
+function handleListModels(env, cors) {
+  const models = [];
+  const seen = new Set();
+
+  const addModel = (id) => {
+    if (seen.has(id)) return;
+    seen.add(id);
+    models.push({ id, object: "model", created: 1780000000, owned_by: "aperture" });
+  };
+
+  // Default model
+  const defaultModel = env.DEFAULT_MODEL || "deepseek-v4-flash";
+  addModel(defaultModel);
+
+  // MODEL_MAP entries (both aliases and targets)
+  if (env.MODEL_MAP) {
+    try {
+      const map = JSON.parse(env.MODEL_MAP);
+      for (const [alias, target] of Object.entries(map)) {
+        addModel(alias);
+        addModel(target);
+      }
+    } catch { /* ignore invalid JSON */ }
+  }
+
+  // Common AI client model IDs — all fall back to DEFAULT_MODEL at runtime
+  const common = [
+    "claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514",
+    "claude-sonnet-4", "claude-opus-4", "claude-haiku-4-20251001",
+    "o3-mini", "gpt-4o", "gpt-4o-mini",
+  ];
+  for (const id of common) addModel(id);
+
+  return new Response(JSON.stringify({ data: models }), {
+    headers: { "Content-Type": "application/json", ...cors },
+  });
+}
+
 export default {
   async fetch(request, env) {
     const cors = {
@@ -23,6 +66,13 @@ export default {
     };
 
     if (request.method === "OPTIONS") return new Response(null, { headers: cors });
+
+    // Model discovery endpoint — used by Claude Code, Cursor, etc.
+    const path = new URL(request.url).pathname;
+    if (request.method === "GET") {
+      if (path === "/v1/models" || path === "/models") return handleListModels(env, cors);
+      return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
+    }
 
     if (request.method !== "POST") return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
 
@@ -55,7 +105,6 @@ export default {
       return errorResponse("Invalid JSON body", "invalid_request", "PARSE_ERROR", 400);
     }
 
-    const path = new URL(request.url).pathname;
     switch (detectRoute(path, body)) {
       case "chat":      return handleChatCompletions(body, env, request.signal);
       case "responses": return handleResponsesAPI(body, env, request.signal);
