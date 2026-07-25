@@ -28,7 +28,7 @@ const rateLimiter = createRateLimiter(60000, 120);
 function mapModelName(model, env = {}) {
   if (!model) return env.DEFAULT_MODEL || "deepseek-v4-flash";
 
-  const trimmed = model.toLowerCase().trim();
+  const trimmed = String(model).toLowerCase().trim();
   const knownProviders = ["go", "go_proxy", "default", "auto"];
   if (knownProviders.includes(trimmed)) {
     return env.DEFAULT_MODEL || "deepseek-v4-flash";
@@ -87,6 +87,10 @@ export default {
       const raw = await request.text();
       body = JSON.parse(raw);
     } catch {
+      return errorResponse("Invalid JSON body", "invalid_request", "PARSE_ERROR", 400);
+    }
+    // Guard: null or non-object JSON (e.g. client sends literal `null`)
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
       return errorResponse("Invalid JSON body", "invalid_request", "PARSE_ERROR", 400);
     }
 
@@ -296,8 +300,11 @@ async function handleChatCompletions(body, env) {
   }
 
   // Non-streaming: try DSML normalization, fallback to raw pass-through
+  // IMPORTANT: upstreamResponse.body can only be consumed once.
+  // Read as text first so we can retry if JSON.parse fails.
   try {
-    const responseBody = await upstreamResponse.json();
+    const responseText = await upstreamResponse.text();
+    const responseBody = JSON.parse(responseText);
     // Strip non-standard reasoning_content for Trae compatibility
     for (const choice of responseBody.choices || []) {
       if (choice.message?.reasoning_content !== undefined) {
@@ -310,8 +317,8 @@ async function handleChatCompletions(body, env) {
       headers: { "Content-Type": "application/json", ...corsHeaders() },
     });
   } catch {
-    // If JSON parsing fails, pass through raw response
-    return new Response(upstreamResponse.body, {
+    // If JSON parsing fails, return the raw text we already read
+    return new Response(responseText, {
       status: upstreamResponse.status,
       headers: { "Content-Type": "application/json", ...corsHeaders() },
     });
