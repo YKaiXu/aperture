@@ -189,7 +189,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
 
   let contentIndex = 0;
   let textBlockIndex = -1;        // -1 = no text block currently open
-  let thinkingBlockIndex = -1;    // -1 = no thinking block currently open
+  let thinkingAccumulator = "";        // Accumulates reasoning content (not emitted)
   const toolUseMap = {};
   let lastFinishReason = null;
   const streamUsage = { input_tokens: 0, output_tokens: 0 };
@@ -208,26 +208,18 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
       const finishReason = choice.finish_reason;
       if (finishReason) lastFinishReason = finishReason;
 
-      // Thinking (reasoning) content: open ONCE, accumulate deltas, close ONCE.
-      // Anthropic protocol requires thinking blocks to appear before text blocks,
-      // so we close any open text block before opening a thinking block.
+      // Reasoning content: accumulate silently, don't emit as thinking blocks.
+      // We open a text block to ensure proper block sequencing but emit empty
+      // deltas — the model's actual text/tool output is what matters.
       if (reasoning) {
-        if (textBlockIndex !== -1) {
-          yield {
-            event: "content_block_stop",
-            data: { type: "content_block_stop", index: textBlockIndex },
-          };
-          contentIndex++;
-          textBlockIndex = -1;
-        }
-        if (thinkingBlockIndex === -1) {
-          thinkingBlockIndex = contentIndex;
+        if (textBlockIndex === -1) {
+          textBlockIndex = contentIndex;
           yield {
             event: "content_block_start",
             data: {
               type: "content_block_start",
-              index: thinkingBlockIndex,
-              content_block: { type: "thinking", thinking: "" },
+              index: textBlockIndex,
+              content_block: { type: "text", text: "" },
             },
           };
         }
@@ -235,8 +227,8 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
           event: "content_block_delta",
           data: {
             type: "content_block_delta",
-            index: thinkingBlockIndex,
-            delta: { type: "thinking_delta", thinking: reasoning },
+            index: textBlockIndex,
+            delta: { type: "text_delta", text: "" },
           },
         };
       }
@@ -245,15 +237,7 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
       // Bug fix: previously every delta was wrapped in its own start/delta/stop,
       // which made the Anthropic SDK render each token on its own line.
       if (content) {
-        // Close any open thinking block first (Anthropic protocol order)
-        if (thinkingBlockIndex !== -1) {
-          yield {
-            event: "content_block_stop",
-            data: { type: "content_block_stop", index: thinkingBlockIndex },
-          };
-          contentIndex++;
-          thinkingBlockIndex = -1;
-        }
+
         if (textBlockIndex === -1) {
           textBlockIndex = contentIndex;
           yield {
@@ -285,14 +269,6 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
           };
           contentIndex++;
           textBlockIndex = -1;
-        }
-        if (thinkingBlockIndex !== -1) {
-          yield {
-            event: "content_block_stop",
-            data: { type: "content_block_stop", index: thinkingBlockIndex },
-          };
-          contentIndex++;
-          thinkingBlockIndex = -1;
         }
 
         for (const tc of toolCalls) {
@@ -351,14 +327,6 @@ export async function* translateAnthropicStream(upstreamResponse, requestId, mod
     }
   }
 
-  // Close any text or thinking block that was never followed by a tool call.
-  // Close thinking first (Anthropic protocol: thinking before text).
-  if (thinkingBlockIndex !== -1) {
-    yield {
-      event: "content_block_stop",
-      data: { type: "content_block_stop", index: thinkingBlockIndex },
-    };
-  }
   if (textBlockIndex !== -1) {
     yield {
       event: "content_block_stop",
@@ -392,14 +360,6 @@ export async function translateAnthropicJson(upstreamResponse, requestId, model 
   const choice = data.choices?.[0];
   const message = choice?.message || {};
   const content = [];
-
-  // Thinking (reasoning) content — must come before text per Anthropic protocol
-  if (message.reasoning_content) {
-    content.push({
-      type: "thinking",
-      thinking: message.reasoning_content,
-    });
-  }
 
   // Text content
   if (message.content) {
