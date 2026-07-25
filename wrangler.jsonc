@@ -15,8 +15,11 @@
   },
   "vars": {
     "UPSTREAM_BASE_URL": "https://opencode.ai/zen/go/v1",
+    // USE_GATEWAY: explicit switch for AI Gateway routing.
+    // Set via `wrangler secret put USE_GATEWAY true` when Gateway is needed.
     // AI_GATEWAY_URL is set via `wrangler secret put AI_GATEWAY_URL`
     // to avoid exposing the Cloudflare Account ID in this file.
+    "USE_GATEWAY": "false",
     "CUSTOM_PROVIDER_SLUG": "opencode-go",
     "DEFAULT_MODEL": "deepseek-v4-flash",
     "MODEL_MAP": "{\"dv4f\":\"deepseek-v4-flash\",\"aigo\":\"deepseek-v4-flash\"}",

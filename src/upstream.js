@@ -4,36 +4,46 @@
 
 import { fetchUpstream } from "./helpers.js";
 
-function buildUpstreamUrl(env) {
-  // Direct mode: skip AI Gateway entirely
+/**
+ * Whether to route through Cloudflare AI Gateway.
+ *
+ * Explicit env var (USE_GATEWAY) is the single source of truth — no implicit
+ * detection from AI_GATEWAY_URL presence, avoiding silent mode changes from
+ * residual secrets.
+ *
+ * Falls back to BYPASS_GATEWAY (inverted) for backward compatibility.
+ */
+function useGateway(env) {
+  if (env.USE_GATEWAY === "true" || env.USE_GATEWAY === "1") return true;
+  if (env.USE_GATEWAY === "false" || env.USE_GATEWAY === "0") return false;
+  // Backward compat: BYPASS_GATEWAY=true → direct
   const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
-  if (bypass) {
-    const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
-    return `${baseUrl}/chat/completions`;
-  }
+  if (bypass) return false;
+  // Backward compat: old implicit AI_GATEWAY_URL detection
+  return !!(env.AI_GATEWAY_URL || "").trim();
+}
 
-  // AI Gateway route
-  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
-  if (gwUrl) {
-    const base = gwUrl.replace(/\/+$/, "");
-    const slug = env.CUSTOM_PROVIDER_SLUG || "";
-    return slug ? `${base}/custom-${slug}/v1/chat/completions` : `${base}/chat/completions`;
+function buildUpstreamUrl(env) {
+  if (useGateway(env)) {
+    const gwUrl = (env.AI_GATEWAY_URL || "").trim();
+    if (gwUrl) {
+      const base = gwUrl.replace(/\/+$/, "");
+      const slug = env.CUSTOM_PROVIDER_SLUG || "";
+      return slug ? `${base}/custom-${slug}/v1/chat/completions` : `${base}/chat/completions`;
+    }
   }
-  // Direct route (fallback)
+  // Direct route
   const baseUrl = env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1";
   return `${baseUrl}/chat/completions`;
 }
 
 function chooseApiKey(env) {
-  const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
-  if (bypass) {
-    return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
-  }
-
-  // In Gateway mode, use Gateway token (Gateway stores upstream API key)
-  const gwUrl = (env.AI_GATEWAY_URL || "").trim();
-  if (gwUrl) {
-    return env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
+  // Gateway mode: Gateway token first (Gateway stores upstream API key)
+  if (useGateway(env)) {
+    const gwUrl = (env.AI_GATEWAY_URL || "").trim();
+    if (gwUrl) {
+      return env.AI_GATEWAY_TOKEN || env.OPENCODE_API_KEY;
+    }
   }
   return env.OPENCODE_API_KEY || env.AI_GATEWAY_TOKEN;
 }
@@ -84,8 +94,7 @@ export async function sendChatRequest(env, chatBody, clientSignal) {
     if (response.ok) return response;
 
     // Gateway error (5xx) -> fallback directly to upstream
-    const bypass = env.BYPASS_GATEWAY === "true" || env.BYPASS_GATEWAY === "1";
-    const usingGateway = !bypass && (env.AI_GATEWAY_URL || "").trim();
+    const usingGateway = useGateway(env) && (env.AI_GATEWAY_URL || "").trim();
 
     if (response.status >= 500 && usingGateway) {
       const fallbackUrl = (env.UPSTREAM_BASE_URL || "https://opencode.ai/zen/go/v1") + "/chat/completions";
