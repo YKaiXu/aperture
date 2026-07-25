@@ -41,7 +41,7 @@ function chooseApiKey(env) {
 export async function sendChatRequest(env, chatBody) {
   const url = buildUpstreamUrl(env);
   const apiKey = chooseApiKey(env);
-  const timeout = parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10);
+  const timeout = Math.max(1000, parseInt(env.REQUEST_TIMEOUT_MS || "120000", 10) || 120000);
 
   const response = await fetchUpstream(
     url,

@@ -92,7 +92,10 @@ export function corsHeaders(extra = {}) {
 export function authenticate(request, env) {
   const expected = env.AI_GATEWAY_TOKEN;
   if (!expected) {
-    return { ok: false, error: "Server configuration error", code: "CONFIG_ERROR", status: 500 };
+    // Log config error server-side but return 401 to avoid leaking configuration state
+    const log = createLogger("auth");
+    log.error("auth.missing_token", { message: "AI_GATEWAY_TOKEN not configured" });
+    return { ok: false, error: "Invalid or missing API key", code: "UNAUTHORIZED", status: 401 };
   }
   // Try Authorization: Bearer first, then x-api-key
   let token = null;
@@ -260,6 +263,14 @@ export async function fetchUpstream(url, options, timeoutMs = 120000) {
   try {
     const response = await fetch(url, { ...options, signal: controller.signal });
     return response;
+  } catch (err) {
+    if (err.name === "AbortError") {
+      return new Response(
+        JSON.stringify({ error: { message: "Request timed out", type: "timeout_error" } }),
+        { status: 504 }
+      );
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -273,6 +284,12 @@ export function createRateLimiter(windowMs, maxRequests) {
   return {
     check(key) {
       const now = Date.now();
+      // Prune stale entries every ~50 checks to prevent unbounded growth
+      if (hits.size > maxRequests * 2 && Math.random() < 0.02) {
+        for (const [k, v] of hits) {
+          if (now - v.windowStart > windowMs) hits.delete(k);
+        }
+      }
       const record = hits.get(key);
       if (!record || now - record.windowStart > windowMs) {
         hits.set(key, { windowStart: now, count: 1 });

@@ -60,13 +60,11 @@ export default {
       return errorResponse("Method not allowed", "invalid_request", "METHOD_NOT_ALLOWED", 405);
     }
 
-    // ── Authentication ─────────────────────────────────
-    const auth = authenticate(request, env);
-    if (!auth.ok) {
-      return errorResponse(auth.error, "authentication_error", auth.code, auth.status);
-    }
-
-    // ── Rate Limiting ──────────────────────────────────
+    // ── Rate Limiting (before auth to throttle brute force) ──────────────────────────────────
+    const rateLimiter = createRateLimiter(
+      Math.max(1000, parseInt(env.RATE_LIMIT_WINDOW_MS || "60000", 10) || 60000),
+      Math.max(1, parseInt(env.RATE_LIMIT_MAX || "120", 10) || 120)
+    );
     const clientIp = request.headers.get("CF-Connecting-IP") || "unknown";
     const rateCheck = rateLimiter.check(clientIp);
     if (!rateCheck.allowed) {
@@ -132,6 +130,7 @@ function pipeEventStream(stream, extraHeaders = {}) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
+  const log = createLogger("stream");
 
   (async () => {
     try {
@@ -140,9 +139,10 @@ function pipeEventStream(stream, extraHeaders = {}) {
         await writer.write(encoder.encode(raw));
       }
     } catch (err) {
+      log.error("stream.error", { message: err.message, stack: err.stack });
       try {
         await writer.write(
-          encoder.encode(`event: error\ndata: {"type":"error","error":{"message":"Internal error"}}\n\n`)
+          encoder.encode(`event: error\ndata: {"type":"error","error":{"message":"Internal stream error"}}\n\n`)
         );
       } catch { /* ignore */ }
     } finally {
@@ -168,14 +168,16 @@ function pipeChatStream(stream) {
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
+  const log = createLogger("stream");
 
   (async () => {
     try {
       for await (const line of stream) {
         await writer.write(encoder.encode(line + "\n"));
       }
-    } catch { /* ignore write errors if client disconnected */ }
-    finally {
+    } catch (err) {
+      log.error("stream.error", { message: err.message, stack: err.stack });
+    } finally {
       try { await writer.close(); } catch { /* ignore */ }
     }
   })();
@@ -202,10 +204,14 @@ function pipeChatStream(stream) {
 async function* filterChatStream(upstreamResponse) {
   const reader = upstreamResponse.body.pipeThrough(new TextDecoderStream()).getReader();
   let buffer = "";
+  const MAX_BUFFER = 2 * 1024 * 1024; // 2 MB cap to prevent memory exhaustion
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
     buffer += value;
+    if (buffer.length > MAX_BUFFER) {
+      throw new Error("SSE buffer exceeded maximum size");
+    }
     const lines = buffer.split("\n");
     buffer = lines.pop() || "";
     for (const line of lines) {
@@ -275,8 +281,11 @@ async function handleChatCompletions(body, env) {
   const upstreamResponse = await sendChatRequest(env, body);
   if (!upstreamResponse.ok) {
     const errBody = await safeReadUpstreamBody(upstreamResponse);
+    // Log detailed upstream error server-side, return generic message to client
+    const log = createLogger("chat");
+    log.error("upstream.failed", { status: upstreamResponse.status, detail: errBody });
     return errorResponse(
-      `Upstream returned ${upstreamResponse.status} - ${errBody}`,
+      "Upstream request failed",
       "upstream_error", "UPSTREAM", upstreamResponse.status
     );
   }
@@ -289,6 +298,12 @@ async function handleChatCompletions(body, env) {
   // Non-streaming: try DSML normalization, fallback to raw pass-through
   try {
     const responseBody = await upstreamResponse.json();
+    // Strip non-standard reasoning_content for Trae compatibility
+    for (const choice of responseBody.choices || []) {
+      if (choice.message?.reasoning_content !== undefined) {
+        delete choice.message.reasoning_content;
+      }
+    }
     const normalizedBody = normalizeDsmlToolCalls(responseBody);
     return new Response(JSON.stringify(normalizedBody), {
       status: upstreamResponse.status,
@@ -317,6 +332,9 @@ async function handleResponsesAPI(body, env) {
   const upstreamResponse = await sendChatRequest(env, chatReq);
   if (!upstreamResponse.ok) {
     const errMsg = await readUpstreamErrorSafe(upstreamResponse);
+    // Log detailed upstream error server-side, return generic message to client
+    const log = createLogger("responses");
+    log.error("upstream.failed", { status: upstreamResponse.status, detail: errMsg });
     return new Response(
       JSON.stringify({
         id: respId,
@@ -324,7 +342,7 @@ async function handleResponsesAPI(body, env) {
         created_at: now(),
         model: chatReq.model,
         output: [],
-        error: { message: errMsg, type: "invalid_request_error", code: "invalid_request_error" },
+        error: { message: "Upstream request failed", type: "invalid_request_error", code: "invalid_request_error" },
       }),
       {
         status: upstreamResponse.status,
@@ -348,10 +366,11 @@ async function handleResponsesAPI(body, env) {
 // ─── Anthropic Messages API Handler ───────────────────
 
 function anthropicHeaders(extra = {}) {
+  const reqId = uid("req");
   return {
     "Content-Type": "application/json",
-    "x-request-id": uid("req"),
-    "request-id": uid("req"),
+    "x-request-id": reqId,
+    "request-id": reqId,
     ...extra,
     ...corsHeaders(),
   };
@@ -368,11 +387,14 @@ async function handleAnthropicMessages(body, env) {
   const upstreamResponse = await sendChatRequest(env, chatReq);
   if (!upstreamResponse.ok) {
     const errMsg = await readUpstreamErrorSafe(upstreamResponse);
+    // Log detailed upstream error server-side, return generic message to client
+    const log = createLogger("anthropic");
+    log.error("upstream.failed", { status: upstreamResponse.status, detail: errMsg });
     return new Response(
       JSON.stringify({
         id: requestId,
         type: "error",
-        error: { type: "invalid_request_error", message: errMsg },
+        error: { type: "invalid_request_error", message: "Upstream request failed" },
       }),
       {
         status: upstreamResponse.status,
@@ -418,6 +440,8 @@ function normalizeDsmlToolCalls(responseBody) {
 
   // Detect DSML-style tool calls by checking for invoke name pattern
   // DSML format: invoke name="funcName" ... parameter name="..." values
+  // Cap content length before regex to avoid ReDoS on malicious upstream responses
+  if (content.length > 10000) return responseBody;
   if (!/invoke\s+name\s*=\s*"/i.test(content)) return responseBody;
 
   const toolCalls = [];

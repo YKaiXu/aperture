@@ -65,12 +65,11 @@ export function translateAnthropicToChat(body) {
             text += (text ? "\n" : "") + (out || "");
           }
         }
-        if (text || images.length > 0) {
-          messages.push({
-            role: "user",
-            content: text,
-            ...(images.length > 0 ? { images } : {}),
-          });
+        const contentParts = [];
+        if (text) contentParts.push({ type: "text", text });
+        if (images.length > 0) contentParts.push(...images);
+        if (contentParts.length > 0) {
+          messages.push({ role: "user", content: contentParts });
         }
       } else {
         messages.push({ role: "user", content: "" });
@@ -80,8 +79,27 @@ export function translateAnthropicToChat(body) {
     }
 
     if (msg.role === "assistant") {
-      const translated = translateAnthropicContent(msg.content);
-      messages.push({ role: "assistant", content: translated.text });
+      const toolCalls = [];
+      let text = "";
+      for (const block of (Array.isArray(msg.content) ? msg.content : [msg.content])) {
+        if (block.type === "text") {
+          text += block.text || "";
+        } else if (block.type === "tool_use") {
+          toolCalls.push({
+            id: block.id || uid("call"),
+            type: "function",
+            function: {
+              name: block.name || "",
+              arguments: JSON.stringify(block.input || {}),
+            },
+          });
+        }
+      }
+      messages.push({
+        role: "assistant",
+        content: text || null,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      });
       continue;
     }
 
@@ -112,7 +130,6 @@ export function translateAnthropicToChat(body) {
   const paramMap = {
     temperature: "temperature",
     top_p: "top_p",
-    top_k: "top_k",
     stop_sequences: "stop",
     max_tokens: "max_tokens",
   };

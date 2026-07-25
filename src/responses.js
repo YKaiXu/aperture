@@ -33,12 +33,15 @@ export function translateToChat(body) {
   }
 
   // Process input items
-  for (const item of body.input || []) {
-    if (typeof item === "string") {
-      messages.push({ role: "user", content: item });
-      lastAssistantIdx = null;
-      continue;
-    }
+  if (typeof body.input === "string") {
+    messages.push({ role: "user", content: body.input });
+  } else {
+    for (const item of body.input || []) {
+      if (typeof item === "string") {
+        messages.push({ role: "user", content: item });
+        lastAssistantIdx = null;
+        continue;
+      }
 
     switch (item.type || "message") {
       case "message": {
@@ -171,6 +174,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
   let outputIndex = 0;
   let textStarted = false;
   let fullText = "";
+  let currentTextItemId = null;
   let usage = {};
   const toolCallsMap = {};
   const toolOrder = [];
@@ -202,13 +206,14 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
       if (content !== undefined && content !== null && content !== "") {
         if (!textStarted) {
           textStarted = true;
+          currentTextItemId = uid("msg");
           yield {
             event: "response.output_item.added",
             data: {
               type: "response.output_item.added",
               output_index: outputIndex,
               item: {
-                id: uid("msg"),
+                id: currentTextItemId,
                 type: "message",
                 status: "in_progress",
                 role: "assistant",
@@ -306,7 +311,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
           yield { event: "response.output_item.done", data: makeToolCallDone(outputIndex, tc) };
           outputIndex++;
         }
-        toolCallsMap.length = 0;
+        Object.keys(toolCallsMap).forEach(k => delete toolCallsMap[k]);
         toolOrder.length = 0;
       }
     }
@@ -315,7 +320,7 @@ export async function* translateStreamEvents(upstreamResponse, respId) {
   // Flush remaining
   if (textStarted) {
     yield { event: "response.output_text.done", data: makeTextDone(outputIndex, fullText) };
-    yield { event: "response.output_item.done", data: makeTextItemDone(outputIndex, fullText) };
+    yield { event: "response.output_item.done", data: makeTextItemDone(outputIndex, fullText, currentTextItemId) };
     outputIndex++;
   }
   for (const idx of toolOrder) {
@@ -403,12 +408,12 @@ function makeTextDone(idx, text) {
   return { type: "response.output_text.done", output_index: idx, content_index: 0, text };
 }
 
-function makeTextItemDone(idx, text) {
+function makeTextItemDone(idx, text, itemId) {
   return {
     type: "response.output_item.done",
     output_index: idx,
     item: {
-      id: uid("msg"),
+      id: itemId || uid("msg"),
       type: "message",
       status: "completed",
       role: "assistant",
