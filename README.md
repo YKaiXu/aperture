@@ -158,6 +158,48 @@ npx vitest run --coverage   # 覆盖率报告
 | 集成测试 | 完整请求管线 | Mock handler |
 | **E2E 测试** | **全链路：index.js → 真实 HTTP 上游** | **Node http 服务器** |
 
+## 已知限制
+
+### 内置搜索工具不可用
+
+Aperture 是**协议翻译层**，不是 AI 服务提供商。以下依赖服务端基础设施的内置工具**无法工作**：
+
+| 工具 | 协议 | 原因 |
+|---|---|---|
+| `web_search_20250305` | Anthropic Messages | 需要 Anthropic 服务器执行搜索 |
+| `web_search_preview` | OpenAI Responses | 需要 OpenAI 服务器执行搜索 |
+| `computer_use` | Anthropic Messages | 需要 Anthropic 服务器执行操作 |
+
+**自定义工具（function calling）完全正常** ✅ — 包括工具定义、模型产出 tool_use、回传 tool_result 的完整链路。
+
+### 需要搜索怎么办？
+
+Aperture 只做协议翻译，不替客户端执行外部功能。搜索能力由客户端侧解决：
+
+```
+推荐方案：本地 MCP 搜索工具
+Claude Code ──→ MCP 子进程（本机）──→ HTTP 请求搜索 API
+```
+
+配置示例（`~/.claude/settings.json`）：
+
+```json
+{
+  "mcpServers": {
+    "web-fetch": {
+      "command": "npx",
+      "args": ["-y", "@anthropic/mcp-web-search"]
+    }
+  }
+}
+```
+
+### 企业网络限制
+
+如果你的机器部署在公司网络环境下，WebFetch 的 HTTP 请求从本机发出，受公司出站白名单（如 Cowork/Vanta、Zscaler、Netskope 等安全策略）管控。如果需要的域名不在白名单中，WebFetch 无法访问。
+
+**折中方案**：给 Aperture 添加一个 `/v1/fetch` 代理端点，让 Cloudflare Workers（已受白名单信任）代抓内容。详见 [issue #fetch-proxy](https://github.com/YKaiXu/aperture/issues)。
+
 ## 性能
 
 - **bundle < 50KB** — 零外部依赖，极速冷启动
